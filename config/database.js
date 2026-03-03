@@ -123,6 +123,7 @@ const initDatabase = async () => {
         discount DECIMAL(5,2) NOT NULL DEFAULT 0,
         final_amount DECIMAL(10,2) NOT NULL,
         status ENUM('Paid', 'Partial') DEFAULT 'Paid',
+        sale_type ENUM('retail', 'wholesale') DEFAULT 'retail',
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (client_id) REFERENCES clients(id) ON DELETE SET NULL
       )

@@ -98,7 +98,7 @@ router.get('/', async (req, res) => {
 router.post('/', async (req, res) => {
   try {
     const userId = req.headers['x-user-id'];
-    const { client_id, payment_method, status = 'Paid', total_amount, discount = 0, final_amount, items, paid_amount } = req.body;
+    const { client_id, payment_method, status = 'Paid', total_amount, discount = 0, final_amount, items, paid_amount, sale_type = 'retail' } = req.body;
     if (!payment_method) return res.status(400).json({ error: 'Payment method is required' });
     if (total_amount === undefined) return res.status(400).json({ error: 'Total amount is required' });
     if (final_amount === undefined) return res.status(400).json({ error: 'Final amount is required' });
@@ -127,8 +127,8 @@ router.post('/', async (req, res) => {
 
     // Create sale record
     const [result] = await pool.query(
-      'INSERT INTO sales (date, client_id, client_name, items_count, payment_method, total_amount, discount, final_amount, status) VALUES (CURDATE(), ?, ?, ?, ?, ?, ?, ?, ?)',
-      [client_id || null, client_name, items.length, payment_method, total_amount, discount, normalizedFinalAmount, normalizedStatus]
+      'INSERT INTO sales (date, client_id, client_name, items_count, payment_method, total_amount, discount, final_amount, status, sale_type) VALUES (CURDATE(), ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      [client_id || null, client_name, items.length, payment_method, total_amount, discount, normalizedFinalAmount, normalizedStatus, sale_type || 'retail']
     );
 
     const saleId = result.insertId;
