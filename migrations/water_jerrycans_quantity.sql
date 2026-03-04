@@ -1,9 +1,20 @@
 -- Migration: Change water_jerrycans from individual rows to quantity-based
 -- This reduces database size significantly
+-- MySQL compatible syntax (no IF NOT EXISTS for columns)
 
 -- Add quantity column if it doesn't exist
-ALTER TABLE water_jerrycans 
-ADD COLUMN IF NOT EXISTS quantity INT DEFAULT 1;
+SET @dbname = DATABASE();
+SET @tablename = 'water_jerrycans';
+SET @columnname = 'quantity';
+SET @preparedStatement = (SELECT IF(
+  (SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS 
+   WHERE TABLE_SCHEMA = @dbname AND TABLE_NAME = @tablename AND COLUMN_NAME = @columnname) > 0,
+  'SELECT 1',
+  'ALTER TABLE water_jerrycans ADD COLUMN quantity INT DEFAULT 1'
+));
+PREPARE alterIfNotExists FROM @preparedStatement;
+EXECUTE alterIfNotExists;
+DEALLOCATE PREPARE alterIfNotExists;
 
 -- Create a new consolidated table structure
 -- First, consolidate existing rows into quantity-based records

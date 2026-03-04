@@ -1,6 +1,15 @@
 const { pool } = require('./config/database');
 const fs = require('fs');
 
+// Helper function to check if column exists
+async function columnExists(tableName, columnName) {
+  const [rows] = await pool.query(`
+    SELECT COUNT(*) as count FROM INFORMATION_SCHEMA.COLUMNS 
+    WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?
+  `, [tableName, columnName]);
+  return rows[0].count > 0;
+}
+
 async function runMigration() {
   try {
     console.log('🔄 Running email settings migration...');
@@ -23,18 +32,20 @@ async function runMigration() {
     console.log('✅ email_settings table created');
     
     // Add notification_email to users table
-    await pool.query(`
-      ALTER TABLE users 
-      ADD COLUMN IF NOT EXISTS notification_email VARCHAR(255) NULL
-    `);
-    console.log('✅ notification_email column added to users table');
+    if (!(await columnExists('users', 'notification_email'))) {
+      await pool.query(`ALTER TABLE users ADD COLUMN notification_email VARCHAR(255) NULL`);
+      console.log('✅ notification_email column added to users table');
+    } else {
+      console.log('⏭️ notification_email column already exists in users table');
+    }
     
     // Add notification_email to notification_settings table
-    await pool.query(`
-      ALTER TABLE notification_settings 
-      ADD COLUMN IF NOT EXISTS notification_email VARCHAR(255) NULL
-    `);
-    console.log('✅ notification_email column added to notification_settings table');
+    if (!(await columnExists('notification_settings', 'notification_email'))) {
+      await pool.query(`ALTER TABLE notification_settings ADD COLUMN notification_email VARCHAR(255) NULL`);
+      console.log('✅ notification_email column added to notification_settings table');
+    } else {
+      console.log('⏭️ notification_email column already exists in notification_settings table');
+    }
     
     // Insert default email settings
     await pool.query(`

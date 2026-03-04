@@ -44,10 +44,7 @@ CREATE TABLE IF NOT EXISTS water_sales (
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 );
 
--- Add indexes for better performance
-CREATE INDEX IF NOT EXISTS idx_water_jerrycans_status ON water_jerrycans(status);
-CREATE INDEX IF NOT EXISTS idx_water_additions_date ON water_additions(date);
-CREATE INDEX IF NOT EXISTS idx_water_sales_created_at ON water_sales(created_at);
+-- Add indexes for better performance (ignore errors if already exist)
 
 -- Insert some sample data for testing
 INSERT IGNORE INTO water_jerrycans (serial_number, capacity, status, selling_price) VALUES
