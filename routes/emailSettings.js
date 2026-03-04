@@ -14,6 +14,7 @@ router.get('/', async (req, res) => {
       return res.status(403).json({ success: false, error: 'Access denied' });
     }
 
+    
     const [settings] = await pool.query('SELECT * FROM email_settings WHERE is_active = TRUE LIMIT 1');
     
     if (settings.length === 0) {

@@ -18,6 +18,10 @@ const { logActivity } = require('../utils/activityLogger');
     // Add reference_id to water_jerrycans for linking to purchases
     await pool.query(`ALTER TABLE water_jerrycans ADD COLUMN IF NOT EXISTS reference_id INT NULL`);
     
+    // Add water_price and bottle_price_sold columns to water_sales for accurate profit tracking
+    await pool.query(`ALTER TABLE water_sales ADD COLUMN IF NOT EXISTS water_price DECIMAL(10, 2) DEFAULT 0`);
+    await pool.query(`ALTER TABLE water_sales ADD COLUMN IF NOT EXISTS bottle_price_sold DECIMAL(10, 2) DEFAULT 0`);
+    
     // Check if we need to consolidate (if there are many rows with quantity=1)
     const [checkRows] = await pool.query(`SELECT COUNT(*) as cnt FROM water_jerrycans WHERE quantity = 1`);
     const rowCount = checkRows[0]?.cnt || 0;
@@ -138,7 +142,8 @@ router.get('/sales', async (req, res) => {
     let query = `
       SELECT s.*, 
              a.supplier_name as purchase_supplier,
-             a.buying_price_per_jerrycan as purchase_price,
+             a.buying_price_per_jerrycan as purchase_water_cost,
+             a.bottle_price as purchase_bottle_cost,
              a.date as purchase_date
       FROM water_sales s
       LEFT JOIN water_additions a ON s.purchase_id = a.id
@@ -156,31 +161,17 @@ router.get('/sales', async (req, res) => {
     
     const [sales] = await pool.query(query, params);
     
-    // Calculate summary
-    const totalSales = sales.reduce((sum, sale) => sum + (sale.jerrycans_sold * (sale.capacity || 20)), 0);
+    // Calculate summary using stored profit values
+    const totalLiters = sales.reduce((sum, sale) => sum + (sale.jerrycans_sold * (sale.capacity || 20)), 0);
     const totalRevenue = sales.reduce((sum, sale) => sum + parseFloat(sale.total_amount || 0), 0);
+    const totalProfit = sales.reduce((sum, sale) => sum + parseFloat(sale.profit || 0), 0);
     const salesCount = sales.length;
-    
-    // We need to fetch total costs (investments) for the same period to calculate accurate profit
-    let additionsQuery = 'SELECT SUM(total_buying_cost) as totalCost FROM water_additions';
-    let additionsParams = [];
-    if (dateFilter) {
-      additionsQuery += ' WHERE ' + dateFilter.replace(/s\./g, '');
-      if (start_date && end_date) {
-        additionsParams = [start_date, end_date];
-      }
-    }
-    const [costResult] = await pool.query(additionsQuery, additionsParams);
-    const totalCost = parseFloat(costResult[0].totalCost || 0);
-    const netProfit = totalRevenue - totalCost;
 
     const summary = {
-      totalLiters: totalSales,
+      totalLiters,
       totalRevenue,
-      totalProfit: netProfit,
-      salesCount,
-      totalCost,
-      netProfit
+      totalProfit,
+      salesCount
     };
     
     res.json({
@@ -199,19 +190,22 @@ router.get('/sales', async (req, res) => {
 router.post('/sales', async (req, res) => {
   try {
     const userId = req.headers['x-user-id'];
-    const { jerrycans_sold, price_per_jerrycan, customer_name, payment_method, notes, water_name, capacity, customer_brings_bottle, includes_bottle } = req.body;
+    const { jerrycans_sold, price_per_jerrycan, customer_name, payment_method, notes, water_name, capacity, customer_brings_bottle, includes_bottle, water_price, bottle_price } = req.body;
 
     if (!jerrycans_sold || !price_per_jerrycan) {
       return res.status(400).json({ error: 'Jerrycans sold and price per jerrycan are required' });
     }
 
     const total_amount = jerrycans_sold * price_per_jerrycan;
-    const profit = 0;
     const custName = customer_name && String(customer_name).trim() ? String(customer_name).trim() : 'Client';
     const wName = water_name && String(water_name).trim() ? String(water_name).trim() : null;
     const cap = capacity != null ? parseInt(capacity, 10) : null;
     const customerBringsBottle = customer_brings_bottle === true;
     const includesBottle = includes_bottle === true;
+    
+    // Store the water and bottle prices from the sale
+    const saleWaterPrice = parseFloat(water_price) || 0;
+    const saleBottlePrice = parseFloat(bottle_price) || 0;
 
     // Find filled stock for this product (quantity-based)
     const [stockRows] = await pool.query(
@@ -227,11 +221,41 @@ router.post('/sales', async (req, res) => {
     const stockId = stockRows[0].id;
     const currentQty = stockRows[0].quantity;
     const purchaseId = stockRows[0].reference_id;
+    
+    // Get purchase costs to calculate profit
+    let buyingPricePerJerrycan = 0;
+    let purchaseBottlePrice = 0;
+    
+    if (purchaseId) {
+      const [purchaseRows] = await pool.query(
+        'SELECT buying_price_per_jerrycan, bottle_price FROM water_additions WHERE id = ?',
+        [purchaseId]
+      );
+      if (purchaseRows.length > 0) {
+        buyingPricePerJerrycan = parseFloat(purchaseRows[0].buying_price_per_jerrycan) || 0;
+        purchaseBottlePrice = parseFloat(purchaseRows[0].bottle_price) || 0;
+      }
+    }
+    
+    // Calculate profit based on sale type
+    let profit = 0;
+    if (customerBringsBottle) {
+      // Water only (swap) - customer brings empty bottle, gets filled one
+      // Revenue = water price, Cost = water buying cost
+      profit = (saleWaterPrice - buyingPricePerJerrycan) * jerrycans_sold;
+    } else if (includesBottle) {
+      // Water + Bottle - new customer takes both
+      // Revenue = water price + bottle price, Cost = water buying cost + bottle cost
+      profit = ((saleWaterPrice + saleBottlePrice) - (buyingPricePerJerrycan + purchaseBottlePrice)) * jerrycans_sold;
+    } else {
+      // Bottle only (rare case)
+      profit = (saleBottlePrice - purchaseBottlePrice) * jerrycans_sold;
+    }
 
-    // Create sale record with purchase_id
+    // Create sale record with purchase_id and calculated profit
     const [result] = await pool.query(
-      'INSERT INTO water_sales (water_name, capacity, jerrycans_sold, price_per_jerrycan, total_amount, profit, customer_name, payment_method, notes, customer_brings_bottle, includes_bottle, purchase_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-      [wName || 'Water', cap || 20, jerrycans_sold, price_per_jerrycan, total_amount, profit, custName, payment_method || 'cash', notes || '', customerBringsBottle, includesBottle, purchaseId]
+      'INSERT INTO water_sales (water_name, capacity, jerrycans_sold, price_per_jerrycan, total_amount, profit, customer_name, payment_method, notes, customer_brings_bottle, includes_bottle, purchase_id, water_price, bottle_price_sold) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      [wName || 'Water', cap || 20, jerrycans_sold, price_per_jerrycan, total_amount, profit, custName, payment_method || 'cash', notes || '', customerBringsBottle, includesBottle, purchaseId, saleWaterPrice, saleBottlePrice]
     );
 
     // Handle bottle inventory based on whether customer takes bottle or brings their own
@@ -290,6 +314,8 @@ router.post('/sales', async (req, res) => {
         price_per_jerrycan,
         total_amount,
         profit,
+        water_price: saleWaterPrice,
+        bottle_price_sold: saleBottlePrice,
         customer_name: custName,
         payment_method: payment_method || 'cash',
         notes: notes || '',
@@ -439,7 +465,38 @@ router.put('/sales/:id', async (req, res) => {
     
     // Update the sale record
     const total_amount = jerrycans_sold * price_per_jerrycan;
-    const profit = 0;
+    
+    // Get the original water_price and bottle_price_sold to recalculate profit
+    const saleWaterPrice = parseFloat(originalSale.water_price) || 0;
+    const saleBottlePrice = parseFloat(originalSale.bottle_price_sold) || 0;
+    
+    // Get purchase costs to recalculate profit
+    let buyingPricePerJerrycan = 0;
+    let purchaseBottlePrice = 0;
+    
+    if (originalPurchaseId) {
+      const [purchaseRows] = await pool.query(
+        'SELECT buying_price_per_jerrycan, bottle_price FROM water_additions WHERE id = ?',
+        [originalPurchaseId]
+      );
+      if (purchaseRows.length > 0) {
+        buyingPricePerJerrycan = parseFloat(purchaseRows[0].buying_price_per_jerrycan) || 0;
+        purchaseBottlePrice = parseFloat(purchaseRows[0].bottle_price) || 0;
+      }
+    }
+    
+    // Recalculate profit based on sale type
+    let profit = 0;
+    if (originalCustomerBringsBottle) {
+      // Water only (swap)
+      profit = (saleWaterPrice - buyingPricePerJerrycan) * jerrycans_sold;
+    } else if (originalIncludesBottle) {
+      // Water + Bottle
+      profit = ((saleWaterPrice + saleBottlePrice) - (buyingPricePerJerrycan + purchaseBottlePrice)) * jerrycans_sold;
+    } else {
+      // Bottle only
+      profit = (saleBottlePrice - purchaseBottlePrice) * jerrycans_sold;
+    }
     
     await pool.query(
       'UPDATE water_sales SET jerrycans_sold = ?, price_per_jerrycan = ?, total_amount = ?, profit = ?, customer_name = ?, payment_method = ?, notes = ?, water_name = ?, capacity = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
@@ -658,7 +715,12 @@ router.post('/additions', async (req, res) => {
     const health = ['good', 'damaged', 'needs_repair'].includes(bottle_health) ? bottle_health : 'good';
 
     const total_liters = jerrycanStatus === 'filled' ? jerrycans_added * liters_per_jerrycan : 0;
-    const total_buying_cost = jerrycans_added * (buying + bottlePrice);
+    // For filled jerrycans: cost = water cost only (we swap bottles with distributor)
+    // For empty bottles: cost = bottle cost only (we're buying new bottles)
+    // bottle_price is stored separately for profit calculation when customer takes bottle
+    const total_buying_cost = jerrycanStatus === 'filled' 
+      ? jerrycans_added * buying  // Water cost only for filled
+      : jerrycans_added * bottlePrice;  // Bottle cost only for empty
     const total_selling_price = jerrycans_added * selling;
     const expected_profit = total_selling_price - total_buying_cost;
     
@@ -678,7 +740,34 @@ router.post('/additions', async (req, res) => {
 
     const purchaseId = result.insertId;
 
-    // 2. Use quantity-based approach: check if record exists, update quantity or insert new
+    // 2. Handle bottle stock based on purchase type
+    if (jerrycanStatus === 'filled') {
+      // BUYING FILLED WATER: You give empty bottles to distributor, get filled ones back
+      // First, reduce empty bottle stock (you gave them to distributor)
+      const [emptyRows] = await pool.query(
+        'SELECT id, quantity FROM water_jerrycans WHERE water_name = ? AND capacity = ? AND status = ? LIMIT 1',
+        [wName, liters_per_jerrycan, 'empty']
+      );
+      
+      if (emptyRows.length > 0) {
+        const currentEmptyQty = emptyRows[0].quantity;
+        const newEmptyQty = currentEmptyQty - jerrycans_added;
+        
+        if (newEmptyQty <= 0) {
+          // Delete empty stock record if no more empty bottles
+          await pool.query('DELETE FROM water_jerrycans WHERE id = ?', [emptyRows[0].id]);
+        } else {
+          // Reduce empty bottle quantity
+          await pool.query(
+            'UPDATE water_jerrycans SET quantity = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+            [newEmptyQty, emptyRows[0].id]
+          );
+        }
+      }
+      // Note: If no empty bottles exist, we still add filled ones (maybe first purchase or new bottles)
+    }
+
+    // 3. Add to stock (filled or empty based on purchase type)
     const [existingRows] = await pool.query(
       'SELECT id, quantity FROM water_jerrycans WHERE water_name = ? AND capacity = ? AND status = ? AND reference_id IS NULL LIMIT 1',
       [wName, liters_per_jerrycan, jerrycanStatus]
@@ -749,7 +838,11 @@ router.put('/additions/:id', async (req, res) => {
     const bottlePrice = parseFloat(bottle_price) || 0;
     const jerrycanStatus = status === 'empty' ? 'empty' : 'filled';
     const total_liters = jerrycanStatus === 'filled' ? jerrycans_added * liters_per_jerrycan : 0;
-    const total_buying_cost = jerrycans_added * (buying + bottlePrice);
+    // For filled jerrycans: cost = water cost only (we swap bottles with distributor)
+    // For empty bottles: cost = bottle cost only (we're buying new bottles)
+    const total_buying_cost = jerrycanStatus === 'filled' 
+      ? jerrycans_added * buying  // Water cost only for filled
+      : jerrycans_added * bottlePrice;  // Bottle cost only for empty
     const total_selling_price = jerrycans_added * selling;
     const expected_profit = total_selling_price - total_buying_cost;
     
@@ -762,13 +855,11 @@ router.put('/additions/:id', async (req, res) => {
       }
     }
     
-    // Get the water_name from the existing record
-    const [existingRecord] = await pool.query('SELECT water_name FROM water_additions WHERE id = ?', [id]);
+    // Get the original record details
+    const [existingRecord] = await pool.query('SELECT water_name, jerrycans_added, status as original_status FROM water_additions WHERE id = ?', [id]);
     const waterName = existingRecord[0]?.water_name || '';
-    
-    // First, get the original quantity to calculate the difference
-    const [originalRecord] = await pool.query('SELECT jerrycans_added FROM water_additions WHERE id = ?', [id]);
-    const originalQty = originalRecord[0]?.jerrycans_added || 0;
+    const originalQty = existingRecord[0]?.jerrycans_added || 0;
+    const originalStatus = existingRecord[0]?.original_status || 'filled';
     const quantityDiff = jerrycans_added - originalQty;
     
     await pool.query(
@@ -776,7 +867,40 @@ router.put('/additions/:id', async (req, res) => {
       [jerrycans_added, liters_per_jerrycan, total_liters, buying, selling, bottlePrice, jerrycanStatus, total_buying_cost, total_selling_price, expected_profit, supplier_name || '', dateVal, id]
     );
     
-    // Update the corresponding stock
+    // Handle empty bottle stock changes for filled water purchases
+    if (jerrycanStatus === 'filled' && quantityDiff !== 0) {
+      // If quantity increased, we need more empty bottles to give to distributor
+      // If quantity decreased, we get empty bottles back
+      const [emptyRows] = await pool.query(
+        'SELECT id, quantity FROM water_jerrycans WHERE water_name = ? AND capacity = ? AND status = ? LIMIT 1',
+        [waterName, liters_per_jerrycan, 'empty']
+      );
+      
+      if (quantityDiff > 0) {
+        // More filled water = reduce more empty bottles
+        if (emptyRows.length > 0) {
+          const newEmptyQty = emptyRows[0].quantity - quantityDiff;
+          if (newEmptyQty <= 0) {
+            await pool.query('DELETE FROM water_jerrycans WHERE id = ?', [emptyRows[0].id]);
+          } else {
+            await pool.query('UPDATE water_jerrycans SET quantity = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', [newEmptyQty, emptyRows[0].id]);
+          }
+        }
+      } else {
+        // Less filled water = restore empty bottles
+        const restoreQty = Math.abs(quantityDiff);
+        if (emptyRows.length > 0) {
+          await pool.query('UPDATE water_jerrycans SET quantity = quantity + ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', [restoreQty, emptyRows[0].id]);
+        } else {
+          await pool.query(
+            'INSERT INTO water_jerrycans (water_name, capacity, status, quantity, serial_number, created_at) VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)',
+            [waterName, liters_per_jerrycan, 'empty', restoreQty, `STOCK-${waterName}-${liters_per_jerrycan}L-empty`]
+          );
+        }
+      }
+    }
+    
+    // Update the corresponding filled stock
     const [stockRows] = await pool.query(
       'SELECT id, quantity FROM water_jerrycans WHERE reference_id = ?',
       [id]
@@ -843,21 +967,48 @@ router.delete('/additions/:id', async (req, res) => {
       });
     }
     
-    // Delete stock linked to this purchase - TWO METHODS:
+    const jerrycans_added = purchase.jerrycans_added || 0;
+    
+    // If this was a filled water purchase, restore empty bottles (reverse the swap)
+    if (status === 'filled' && jerrycans_added > 0) {
+      // Add back to empty stock (you get your empty bottles back)
+      const [emptyRows] = await pool.query(
+        'SELECT id, quantity FROM water_jerrycans WHERE water_name = ? AND capacity = ? AND status = ? LIMIT 1',
+        [water_name, liters_per_jerrycan, 'empty']
+      );
+      
+      if (emptyRows.length > 0) {
+        await pool.query(
+          'UPDATE water_jerrycans SET quantity = quantity + ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+          [jerrycans_added, emptyRows[0].id]
+        );
+      } else {
+        // Create empty stock record
+        await pool.query(
+          'INSERT INTO water_jerrycans (water_name, capacity, status, quantity, serial_number, created_at) VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)',
+          [water_name, liters_per_jerrycan, 'empty', jerrycans_added, `STOCK-${water_name}-${liters_per_jerrycan}L-empty`]
+        );
+      }
+    }
+    
+    // Delete filled stock linked to this purchase - TWO METHODS:
     // Method 1: Delete by reference_id
     await pool.query('DELETE FROM water_jerrycans WHERE reference_id = ?', [id]);
     
-    // Method 2: Also delete by matching attributes (in case reference_id wasn't set)
-    await pool.query(
-      `DELETE FROM water_jerrycans 
-       WHERE water_name = ? 
-       AND capacity = ? 
-       AND status = ?
-       AND selling_price = ?
-       AND bottle_price = ?
-       AND reference_id IS NULL`,
-      [water_name, liters_per_jerrycan, status, selling_price_per_jerrycan, bottle_price]
+    // Method 2: Also reduce quantity by matching attributes (in case reference_id wasn't set)
+    const [filledRows] = await pool.query(
+      'SELECT id, quantity FROM water_jerrycans WHERE water_name = ? AND capacity = ? AND status = ? AND reference_id IS NULL LIMIT 1',
+      [water_name, liters_per_jerrycan, status]
     );
+    
+    if (filledRows.length > 0) {
+      const newQty = filledRows[0].quantity - jerrycans_added;
+      if (newQty <= 0) {
+        await pool.query('DELETE FROM water_jerrycans WHERE id = ?', [filledRows[0].id]);
+      } else {
+        await pool.query('UPDATE water_jerrycans SET quantity = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', [newQty, filledRows[0].id]);
+      }
+    }
     
     // Delete the purchase
     await pool.query('DELETE FROM water_additions WHERE id = ?', [id]);
@@ -1102,13 +1253,12 @@ router.get('/reports', async (req, res) => {
     const [additions] = await pool.query(additionsQuery, params);
     const additionsWithCost = additions.map(a => ({ ...a, total_cost: a.total_buying_cost || a.total_cost || 0 }));
     
-    // Calculate summary
-    const totalSales = sales.reduce((sum, sale) => sum + (sale.jerrycans_sold || 0), 0);
+    // Calculate summary using stored profit values from sales
+    const totalSalesCount = sales.reduce((sum, sale) => sum + (sale.jerrycans_sold || 0), 0);
     const totalRevenue = sales.reduce((sum, sale) => sum + parseFloat(sale.total_amount || 0), 0);
+    const totalProfit = sales.reduce((sum, sale) => sum + parseFloat(sale.profit || 0), 0);
     const totalAdditions = additions.reduce((sum, addition) => sum + (addition.jerrycans_added || 0), 0);
     const totalCost = additions.reduce((sum, addition) => sum + parseFloat(addition.total_buying_cost || addition.total_cost || 0), 0);
-    const netProfit = totalRevenue - totalCost;
-    const totalProfit = netProfit;
     
     res.json({
       success: true,
@@ -1116,12 +1266,11 @@ router.get('/reports', async (req, res) => {
         sales,
         additions: additionsWithCost,
         summary: {
-          totalSales,
+          totalSales: totalSalesCount,
           totalRevenue,
           totalProfit,
           totalAdditions,
-          totalCost,
-          netProfit
+          totalCost
         }
       }
     });
