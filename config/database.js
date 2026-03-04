@@ -303,7 +303,7 @@ const initDatabase = async () => {
         smtp_port INT NOT NULL DEFAULT 587,
         smtp_secure BOOLEAN NOT NULL DEFAULT FALSE,
         smtp_user VARCHAR(255) NOT NULL DEFAULT '',
-        smtp_password TEXT NOT NULL DEFAULT '',
+        smtp_password VARCHAR(255) NOT NULL DEFAULT '',
         notification_email VARCHAR(255) NOT NULL DEFAULT '',
         is_active BOOLEAN NOT NULL DEFAULT FALSE,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,

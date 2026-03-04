@@ -5,7 +5,7 @@ CREATE TABLE IF NOT EXISTS email_settings (
   smtp_port INT NOT NULL DEFAULT 587,
   smtp_secure BOOLEAN NOT NULL DEFAULT FALSE,
   smtp_user VARCHAR(255) NOT NULL,
-  smtp_password TEXT NOT NULL,
+  smtp_password VARCHAR(255) NOT NULL DEFAULT '',
   notification_email VARCHAR(255) NOT NULL,
   is_active BOOLEAN NOT NULL DEFAULT FALSE,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
