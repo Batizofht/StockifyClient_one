@@ -19,7 +19,45 @@ async function savePreviousStock(itemId, currentStock) {
 // GET all purchase orders
 router.get('/', async (req, res) => {
   try {
-    const [orders] = await pool.query('SELECT * FROM purchase_orders ORDER BY created_at DESC');
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 40;
+    const offset = (page - 1) * limit;
+    const dateFilter = req.query.dateFilter || 'today';
+    
+    console.log('📅 Purchase orders - dateFilter:', dateFilter);
+    
+    // Build date filter - default to today
+    let dateCondition = 'DATE(date) = CURDATE()';
+    switch (dateFilter) {
+      case 'today':
+        dateCondition = 'DATE(date) = CURDATE()';
+        break;
+      case 'yesterday':
+        dateCondition = 'DATE(date) = DATE_SUB(CURDATE(), INTERVAL 1 DAY)';
+        break;
+      case 'thisMonth':
+        dateCondition = 'MONTH(date) = MONTH(CURDATE()) AND YEAR(date) = YEAR(CURDATE())';
+        break;
+      case 'lastMonth':
+        dateCondition = 'MONTH(date) = MONTH(DATE_SUB(CURDATE(), INTERVAL 1 MONTH)) AND YEAR(date) = YEAR(DATE_SUB(CURDATE(), INTERVAL 1 MONTH))';
+        break;
+      case 'last7days':
+        dateCondition = 'DATE(date) >= DATE_SUB(CURDATE(), INTERVAL 7 DAY)';
+        break;
+      case 'all':
+        dateCondition = '1=1';
+        break;
+    }
+    
+    console.log('🔍 Purchase orders - SQL condition:', dateCondition);
+    
+    // Get total count with filter
+    const [[{ total }]] = await pool.query(`SELECT COUNT(*) as total FROM purchase_orders WHERE ${dateCondition}`);
+    console.log('📊 Purchase orders - filtered count:', total);
+    const totalPages = Math.ceil(total / limit);
+    console.log('📄 Purchase orders - totalPages:', totalPages, 'limit:', limit);
+    
+    const [orders] = await pool.query(`SELECT * FROM purchase_orders WHERE ${dateCondition} ORDER BY created_at DESC LIMIT ? OFFSET ?`, [limit, offset]);
 
     const ordersWithDetails = [];
     for (const order of orders) {
@@ -35,11 +73,38 @@ router.get('/', async (req, res) => {
         WHERE poi.purchase_order_id = ?
       `, [order.id]);
 
+      // Get debt balance if purchase is on credit
+      let total_paid = 0;
+      let balance = 0;
+      let debt_status = null;
+      
+      if (order.payment_status === 'on_credit' && order.debt_id) {
+        const [[debtInfo]] = await pool.query(`
+          SELECT 
+            d.status as debt_status,
+            COALESCE(SUM(di.amount), 0) as total_paid,
+            (d.amount - COALESCE(SUM(di.amount), 0)) as balance
+          FROM debts d
+          LEFT JOIN debt_installments di ON d.id = di.debt_id
+          WHERE d.id = ?
+          GROUP BY d.id
+        `, [order.debt_id]);
+        
+        if (debtInfo) {
+          total_paid = parseFloat(debtInfo.total_paid) || 0;
+          balance = parseFloat(debtInfo.balance) || 0;
+          debt_status = debtInfo.debt_status;
+        }
+      }
+
       ordersWithDetails.push({
         ...order,
         supplier_name: supplier?.name || 'Unknown Supplier',
         supplier_contact: supplier?.contact || supplier?.phone || '',
         supplier_email: supplier?.email || '',
+        total_paid,
+        balance,
+        debt_status,
         items: items.map(item => ({
           ...item,
           item_name: item.item_name || 'Unknown Item',
@@ -50,7 +115,49 @@ router.get('/', async (req, res) => {
       });
     }
 
-    res.json(ordersWithDetails);
+    // Calculate total stats for the filtered period
+    console.log('📊 Calculating stats with condition:', dateCondition);
+    
+    // Get total orders and total value
+    const [statsRows] = await pool.query(`
+      SELECT 
+        COUNT(*) as totalOrders,
+        COALESCE(SUM(final_amount), 0) as totalValue
+      FROM purchase_orders po 
+      WHERE ${dateCondition}
+    `);
+    
+    // Get total items quantity
+    const [itemsRows] = await pool.query(`
+      SELECT COALESCE(SUM(poi.quantity), 0) as totalItems
+      FROM purchase_order_items poi 
+      INNER JOIN purchase_orders po ON poi.purchase_order_id = po.id
+      WHERE ${dateCondition}
+    `);
+    
+    const totalStats = {
+      totalOrders: statsRows[0].totalOrders,
+      totalValue: statsRows[0].totalValue,
+      totalItems: itemsRows[0].totalItems
+    };
+    console.log('📈 Total stats result:', totalStats);
+
+    res.json({
+      data: ordersWithDetails,
+      pagination: { 
+        page, 
+        limit, 
+        total, 
+        totalPages, 
+        hasNext: page < totalPages, 
+        hasPrev: page > 1,
+        stats: {
+          totalOrders: parseInt(totalStats.totalOrders) || 0,
+          totalValue: parseFloat(totalStats.totalValue) || 0,
+          totalItems: parseInt(totalStats.totalItems) || 0
+        }
+      }
+    });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -60,7 +167,7 @@ router.get('/', async (req, res) => {
 router.post('/', async (req, res) => {
   try {
     const userId = req.headers['x-user-id'];
-    const { supplier_id, total_amount, discount = 0, final_amount, status = 'pending', items } = req.body;
+    const { supplier_id, total_amount, discount = 0, final_amount, status = 'pending', payment_status = 'paid_in_full', amount_paid = 0, items } = req.body;
     if (!supplier_id) return res.status(400).json({ error: 'Supplier ID is required' });
     if (total_amount === undefined) return res.status(400).json({ error: 'Total amount is required' });
     if (final_amount === undefined) return res.status(400).json({ error: 'Final amount is required' });
@@ -73,8 +180,8 @@ router.post('/', async (req, res) => {
     const po_number = `PO-${date}-${time}`;
 
     const [result] = await pool.query(
-      'INSERT INTO purchase_orders (po_number, date, supplier_id, total_amount, discount, final_amount, status) VALUES (?, CURDATE(), ?, ?, ?, ?, ?)',
-      [po_number, supplier_id, total_amount, discount, final_amount, status]
+      'INSERT INTO purchase_orders (po_number, date, supplier_id, total_amount, discount, final_amount, status, payment_status, amount_paid) VALUES (?, CURDATE(), ?, ?, ?, ?, ?, ?, ?)',
+      [po_number, supplier_id, total_amount, discount, final_amount, status, payment_status, amount_paid]
     );
 
     const poId = result.insertId;
@@ -89,8 +196,50 @@ router.post('/', async (req, res) => {
     }
 
     // Get supplier name for logging
-    const [suppliers] = await pool.query('SELECT name FROM suppliers WHERE id = ?', [supplier_id]);
+    const [suppliers] = await pool.query('SELECT name, phone, email FROM suppliers WHERE id = ?', [supplier_id]);
     const supplierName = suppliers[0]?.name || 'Unknown';
+    const supplierPhone = suppliers[0]?.phone || '';
+    const supplierEmail = suppliers[0]?.email || '';
+
+    // If payment is on credit, create a debt record
+    let debtId = null;
+    if (payment_status === 'on_credit') {
+      const balance = final_amount - amount_paid;
+      
+      // Only create debt if there's actually a balance remaining
+      if (balance > 0) {
+        const dueDate = new Date();
+        dueDate.setDate(dueDate.getDate() + 30); // Default 30 days credit period
+        
+        const [debtResult] = await pool.query(
+          `INSERT INTO debts (type, person, amount, date, due_date, description, status, phone, email) 
+           VALUES ('creditor', ?, ?, CURDATE(), ?, ?, 'pending', ?, ?)`,
+          [
+            supplierName,
+            final_amount,
+            dueDate.toISOString().split('T')[0],
+            `Purchase Order ${po_number}`,
+            supplierPhone,
+            supplierEmail
+          ]
+        );
+        debtId = debtResult.insertId;
+        
+        // Link the debt to the purchase order
+        await pool.query(
+          'UPDATE purchase_orders SET debt_id = ? WHERE id = ?',
+          [debtId, poId]
+        );
+        
+        // If partial payment was made, create an installment record
+        if (amount_paid > 0) {
+          await pool.query(
+            `INSERT INTO debt_installments (debt_id, amount, payment_date, notes) VALUES (?, ?, CURDATE(), ?)`,
+            [debtId, amount_paid, 'Initial payment']
+          );
+        }
+      }
+    }
 
     // Log activity
     if (userId) {

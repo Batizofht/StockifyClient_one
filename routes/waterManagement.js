@@ -121,11 +121,38 @@ router.get('/available-products', async (req, res) => {
   }
 });
 
+// GET unique water names from purchases (for suggestions in AddWaterModal)
+router.get('/water-names', async (req, res) => {
+  try {
+    // Get unique water names from both purchases and stock
+    const [rows] = await pool.query(`
+      SELECT DISTINCT water_name 
+      FROM (
+        SELECT water_name FROM water_additions WHERE water_name IS NOT NULL AND water_name != ''
+        UNION
+        SELECT water_name FROM water_jerrycans WHERE water_name IS NOT NULL AND water_name != ''
+      ) AS combined
+      ORDER BY water_name
+    `);
+    
+    const waterNames = rows.map((r, index) => ({
+      id: index + 1,
+      name: r.water_name
+    }));
+    
+    res.json({ success: true, data: waterNames });
+  } catch (error) {
+    console.error('Error in water-names:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // GET water sales with filtering
 router.get('/sales', async (req, res) => {
   try {
-    const { period, start_date, end_date } = req.query;
+    const { period, start_date, end_date, water_name } = req.query;
     let dateFilter = '';
+    let waterNameFilter = '';
     
     if (period === 'today') {
       dateFilter = 'DATE(s.created_at) = CURDATE()';
@@ -137,6 +164,11 @@ router.get('/sales', async (req, res) => {
       dateFilter = 'MONTH(s.created_at) = MONTH(CURDATE()) AND YEAR(s.created_at) = YEAR(CURDATE())';
     } else if (start_date && end_date) {
       dateFilter = 'DATE(s.created_at) BETWEEN ? AND ?';
+    }
+    // Note: 'all' period means no date filter
+    
+    if (water_name) {
+      waterNameFilter = 's.water_name = ?';
     }
     
     let query = `
@@ -150,10 +182,18 @@ router.get('/sales', async (req, res) => {
     `;
     let params = [];
     
-    if (dateFilter) {
-      query += ' WHERE ' + dateFilter;
+    // Combine filters with WHERE clause
+    const filters = [];
+    if (dateFilter) filters.push(dateFilter);
+    if (waterNameFilter) filters.push(waterNameFilter);
+    
+    if (filters.length > 0) {
+      query += ' WHERE ' + filters.join(' AND ');
       if (start_date && end_date) {
         params = [start_date, end_date];
+      }
+      if (water_name) {
+        params.push(water_name);
       }
     }
     
@@ -285,9 +325,11 @@ router.post('/sales', async (req, res) => {
       if (emptyRows.length > 0) {
         await pool.query('UPDATE water_jerrycans SET quantity = quantity + ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', [jerrycans_sold, emptyRows[0].id]);
       } else {
+        // Create empty stock record with unique serial_number
+        const uniqueSerial = `STOCK-${wName || 'Water'}-${cap || 20}L-empty-${Date.now()}`;
         await pool.query(
           'INSERT INTO water_jerrycans (water_name, capacity, status, serial_number, selling_price, quantity, created_at) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)',
-          [wName || 'Water', cap || 20, 'empty', `STOCK-${wName || 'Water'}-${cap || 20}L-empty`, 0, jerrycans_sold]
+          [wName || 'Water', cap || 20, 'empty', uniqueSerial, 0, jerrycans_sold]
         );
       }
     }
@@ -550,10 +592,13 @@ router.delete('/sales/:id', async (req, res) => {
     const userId = req.headers['x-user-id'];
     const { id } = req.params;
     
+    console.log(`[DELETE SALE] Starting delete for sale ID: ${id}`);
+    
     // First, get the sale details
     const [saleRows] = await pool.query('SELECT * FROM water_sales WHERE id = ?', [id]);
     
     if (saleRows.length === 0) {
+      console.log(`[DELETE SALE] Sale not found: ${id}`);
       return res.status(404).json({ error: 'Sale not found' });
     }
     
@@ -567,23 +612,46 @@ router.delete('/sales/:id', async (req, res) => {
       customer_brings_bottle 
     } = sale;
     
+    console.log(`[DELETE SALE] Sale details:`, {
+      water_name,
+      capacity,
+      jerrycans_sold,
+      purchase_id,
+      includes_bottle,
+      customer_brings_bottle
+    });
+    
+    // Get current stock BEFORE restoration
+    const [stockBefore] = await pool.query(
+      'SELECT * FROM water_jerrycans WHERE water_name = ? AND capacity = ?',
+      [water_name, capacity]
+    );
+    console.log(`[DELETE SALE] Stock BEFORE restoration:`, stockBefore);
+    
     // RESTORE WATER BACK TO STOCK based on transaction type
     if (includes_bottle && !customer_brings_bottle) {
       // Customer bought the bottle - restore to filled stock
+      console.log(`[DELETE SALE] Restoring ${jerrycans_sold} to FILLED stock (customer took bottle)`);
       await restoreToStock(water_name, capacity, jerrycans_sold, 'filled');
     } else {
       // Customer brought their own bottle or it was a swap
+      console.log(`[DELETE SALE] Water-only sale - removing from empty, restoring to filled`);
+      
       // Remove from empty stock (if exists)
       const [emptyRows] = await pool.query(
         'SELECT id, quantity FROM water_jerrycans WHERE water_name = ? AND capacity = ? AND status = "empty" LIMIT 1',
         [water_name, capacity]
       );
       
+      console.log(`[DELETE SALE] Empty stock found:`, emptyRows);
+      
       if (emptyRows.length > 0) {
         const currentEmptyQty = emptyRows[0].quantity;
         if (currentEmptyQty <= jerrycans_sold) {
+          console.log(`[DELETE SALE] Deleting empty stock record (qty ${currentEmptyQty} <= ${jerrycans_sold})`);
           await pool.query('DELETE FROM water_jerrycans WHERE id = ?', [emptyRows[0].id]);
         } else {
+          console.log(`[DELETE SALE] Reducing empty stock by ${jerrycans_sold}`);
           await pool.query(
             'UPDATE water_jerrycans SET quantity = quantity - ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
             [jerrycans_sold, emptyRows[0].id]
@@ -592,8 +660,16 @@ router.delete('/sales/:id', async (req, res) => {
       }
       
       // Add to filled stock
+      console.log(`[DELETE SALE] Restoring ${jerrycans_sold} to FILLED stock`);
       await restoreToStock(water_name, capacity, jerrycans_sold, 'filled');
     }
+    
+    // Get current stock AFTER restoration
+    const [stockAfter] = await pool.query(
+      'SELECT * FROM water_jerrycans WHERE water_name = ? AND capacity = ?',
+      [water_name, capacity]
+    );
+    console.log(`[DELETE SALE] Stock AFTER restoration:`, stockAfter);
     
     // UPDATE PURCHASE RECORD IF purchase_id EXISTS
     if (purchase_id) {
@@ -635,30 +711,41 @@ router.delete('/sales/:id', async (req, res) => {
 
 // Helper function to restore water to stock
 async function restoreToStock(water_name, capacity, quantity, status) {
+  console.log(`[restoreToStock] Restoring ${quantity} ${status} bottles for ${water_name} ${capacity}L`);
+  
   const [stockRows] = await pool.query(
     'SELECT id, quantity FROM water_jerrycans WHERE water_name = ? AND capacity = ? AND status = ? LIMIT 1',
     [water_name, capacity, status]
   );
   
+  console.log(`[restoreToStock] Existing stock found:`, stockRows);
+  
   if (stockRows.length > 0) {
     // Update existing stock
+    const newQty = stockRows[0].quantity + quantity;
+    console.log(`[restoreToStock] Updating existing stock ID ${stockRows[0].id}: ${stockRows[0].quantity} + ${quantity} = ${newQty}`);
     await pool.query(
       'UPDATE water_jerrycans SET quantity = quantity + ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
       [quantity, stockRows[0].id]
     );
   } else {
-    // Create new stock record
+    // Create new stock record with unique serial_number
+    const uniqueSerial = `STOCK-${water_name}-${capacity}L-${status}-${Date.now()}`;
+    console.log(`[restoreToStock] Creating new stock record with serial: ${uniqueSerial}`);
     await pool.query(
-      'INSERT INTO water_jerrycans (water_name, capacity, status, quantity, created_at) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)',
-      [water_name, capacity, status, quantity]
+      'INSERT INTO water_jerrycans (water_name, capacity, status, quantity, serial_number, created_at) VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)',
+      [water_name, capacity, status, quantity, uniqueSerial]
     );
   }
+  
+  console.log(`[restoreToStock] Done restoring stock`);
 }
 // GET water additions (with optional period, start_date, end_date)
 router.get('/additions', async (req, res) => {
   try {
-    const { period, start_date, end_date } = req.query;
+    const { period, start_date, end_date, water_name } = req.query;
     let dateFilter = '';
+    let waterNameFilter = '';
     let params = [];
     if (period === 'today') {
       dateFilter = 'DATE(created_at) = CURDATE()';
@@ -672,9 +759,24 @@ router.get('/additions', async (req, res) => {
       dateFilter = 'DATE(created_at) BETWEEN ? AND ?';
       params = [start_date, end_date];
     }
+    // Note: 'all' period means no date filter
+    
+    if (water_name) {
+      waterNameFilter = 'water_name = ?';
+    }
+    
     let query = 'SELECT id, water_name, status, jerrycans_added, liters_per_jerrycan, total_liters, buying_price_per_jerrycan, selling_price_per_jerrycan, COALESCE(bottle_price, 0) as bottle_price, total_buying_cost AS total_cost, total_selling_price, expected_profit, supplier_name, date, created_at, updated_at FROM water_additions';
-    if (dateFilter) {
-      query += ' WHERE ' + dateFilter;
+    
+    // Combine filters
+    const filters = [];
+    if (dateFilter) filters.push(dateFilter);
+    if (waterNameFilter) filters.push(waterNameFilter);
+    
+    if (filters.length > 0) {
+      query += ' WHERE ' + filters.join(' AND ');
+      if (water_name) {
+        params.push(water_name);
+      }
     }
     query += ' ORDER BY created_at DESC';
     const [additions] = await pool.query(query, params);
@@ -768,8 +870,9 @@ router.post('/additions', async (req, res) => {
     }
 
     // 3. Add to stock (filled or empty based on purchase type)
+    // Check for ANY existing stock record for this product (regardless of reference_id)
     const [existingRows] = await pool.query(
-      'SELECT id, quantity FROM water_jerrycans WHERE water_name = ? AND capacity = ? AND status = ? AND reference_id IS NULL LIMIT 1',
+      'SELECT id, quantity FROM water_jerrycans WHERE water_name = ? AND capacity = ? AND status = ? LIMIT 1',
       [wName, liters_per_jerrycan, jerrycanStatus]
     );
     
@@ -780,10 +883,11 @@ router.post('/additions', async (req, res) => {
         [jerrycans_added, selling, bottlePrice, health, existingRows[0].id]
       );
     } else {
-      // Insert new record with quantity AND reference_id
+      // Insert new record with unique serial_number (using timestamp to avoid duplicates)
+      const uniqueSerial = `STOCK-${wName}-${liters_per_jerrycan}L-${jerrycanStatus}-${Date.now()}`;
       await pool.query(
         'INSERT INTO water_jerrycans (water_name, capacity, status, serial_number, selling_price, bottle_price, bottle_health, quantity, reference_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)',
-        [wName, liters_per_jerrycan, jerrycanStatus, `STOCK-${wName}-${liters_per_jerrycan}L-${jerrycanStatus}`, selling, bottlePrice, health, jerrycans_added, purchaseId]
+        [wName, liters_per_jerrycan, jerrycanStatus, uniqueSerial, selling, bottlePrice, health, jerrycans_added, purchaseId]
       );
     }
 
@@ -867,51 +971,53 @@ router.put('/additions/:id', async (req, res) => {
       [jerrycans_added, liters_per_jerrycan, total_liters, buying, selling, bottlePrice, jerrycanStatus, total_buying_cost, total_selling_price, expected_profit, supplier_name || '', dateVal, id]
     );
     
-    // Handle empty bottle stock changes for filled water purchases
-    if (jerrycanStatus === 'filled' && quantityDiff !== 0) {
-      // If quantity increased, we need more empty bottles to give to distributor
-      // If quantity decreased, we get empty bottles back
-      const [emptyRows] = await pool.query(
-        'SELECT id, quantity FROM water_jerrycans WHERE water_name = ? AND capacity = ? AND status = ? LIMIT 1',
-        [waterName, liters_per_jerrycan, 'empty']
-      );
-      
-      if (quantityDiff > 0) {
-        // More filled water = reduce more empty bottles
-        if (emptyRows.length > 0) {
-          const newEmptyQty = emptyRows[0].quantity - quantityDiff;
-          if (newEmptyQty <= 0) {
-            await pool.query('DELETE FROM water_jerrycans WHERE id = ?', [emptyRows[0].id]);
-          } else {
-            await pool.query('UPDATE water_jerrycans SET quantity = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', [newEmptyQty, emptyRows[0].id]);
-          }
-        }
-      } else {
-        // Less filled water = restore empty bottles
-        const restoreQty = Math.abs(quantityDiff);
-        if (emptyRows.length > 0) {
-          await pool.query('UPDATE water_jerrycans SET quantity = quantity + ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', [restoreQty, emptyRows[0].id]);
-        } else {
-          await pool.query(
-            'INSERT INTO water_jerrycans (water_name, capacity, status, quantity, serial_number, created_at) VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)',
-            [waterName, liters_per_jerrycan, 'empty', restoreQty, `STOCK-${waterName}-${liters_per_jerrycan}L-empty`]
-          );
-        }
-      }
-    }
+    // NOTE: When EDITING a purchase, we do NOT adjust empty bottle stock
+    // Empty bottle adjustments only happen during CREATE (swap with distributor)
+    // Editing is for correcting mistakes, not for reversing distributor swaps
     
-    // Update the corresponding filled stock
+    // Update the corresponding stock (filled or empty based on status)
+    // First try by reference_id, then by water_name + capacity + status
     const [stockRows] = await pool.query(
       'SELECT id, quantity FROM water_jerrycans WHERE reference_id = ?',
       [id]
     );
     
     if (stockRows.length > 0) {
-      // Update existing stock
-      await pool.query(
-        'UPDATE water_jerrycans SET quantity = quantity + ?, selling_price = ?, bottle_price = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
-        [quantityDiff, selling, bottlePrice, stockRows[0].id]
+      // Update existing stock by reference_id
+      const newQty = stockRows[0].quantity + quantityDiff;
+      if (newQty <= 0) {
+        await pool.query('DELETE FROM water_jerrycans WHERE id = ?', [stockRows[0].id]);
+      } else {
+        await pool.query(
+          'UPDATE water_jerrycans SET quantity = ?, selling_price = ?, bottle_price = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+          [newQty, selling, bottlePrice, stockRows[0].id]
+        );
+      }
+    } else {
+      // No reference_id match - find by water_name + capacity + status
+      const [matchingStock] = await pool.query(
+        'SELECT id, quantity FROM water_jerrycans WHERE water_name = ? AND capacity = ? AND status = ? LIMIT 1',
+        [waterName, liters_per_jerrycan, jerrycanStatus]
       );
+      
+      if (matchingStock.length > 0) {
+        const newQty = matchingStock[0].quantity + quantityDiff;
+        if (newQty <= 0) {
+          await pool.query('DELETE FROM water_jerrycans WHERE id = ?', [matchingStock[0].id]);
+        } else {
+          await pool.query(
+            'UPDATE water_jerrycans SET quantity = ?, selling_price = ?, bottle_price = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+            [newQty, selling, bottlePrice, matchingStock[0].id]
+          );
+        }
+      } else if (quantityDiff > 0) {
+        // No existing stock found and we're adding - create new record
+        const uniqueSerial = `STOCK-${waterName}-${liters_per_jerrycan}L-${jerrycanStatus}-${Date.now()}`;
+        await pool.query(
+          'INSERT INTO water_jerrycans (water_name, capacity, status, quantity, selling_price, bottle_price, serial_number, reference_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)',
+          [waterName, liters_per_jerrycan, jerrycanStatus, quantityDiff, selling, bottlePrice, uniqueSerial, id]
+        );
+      }
     }
     
     if (userId) {
@@ -969,44 +1075,31 @@ router.delete('/additions/:id', async (req, res) => {
     
     const jerrycans_added = purchase.jerrycans_added || 0;
     
-    // If this was a filled water purchase, restore empty bottles (reverse the swap)
-    if (status === 'filled' && jerrycans_added > 0) {
-      // Add back to empty stock (you get your empty bottles back)
-      const [emptyRows] = await pool.query(
+    // NOTE: When DELETING a purchase, we do NOT restore empty bottles
+    // Deleting is for correcting mistakes, not for reversing distributor swaps
+    // We simply remove the stock that was added by this purchase
+    
+    // Remove stock linked to this purchase
+    // Method 1: Try to find and update by reference_id first
+    const [refRows] = await pool.query('SELECT id, quantity FROM water_jerrycans WHERE reference_id = ?', [id]);
+    
+    if (refRows.length > 0) {
+      // Stock record exists with this reference_id - delete it entirely
+      await pool.query('DELETE FROM water_jerrycans WHERE reference_id = ?', [id]);
+    } else {
+      // No reference_id match - find by water_name + capacity + status and reduce quantity
+      const [stockRows] = await pool.query(
         'SELECT id, quantity FROM water_jerrycans WHERE water_name = ? AND capacity = ? AND status = ? LIMIT 1',
-        [water_name, liters_per_jerrycan, 'empty']
+        [water_name, liters_per_jerrycan, status]
       );
       
-      if (emptyRows.length > 0) {
-        await pool.query(
-          'UPDATE water_jerrycans SET quantity = quantity + ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
-          [jerrycans_added, emptyRows[0].id]
-        );
-      } else {
-        // Create empty stock record
-        await pool.query(
-          'INSERT INTO water_jerrycans (water_name, capacity, status, quantity, serial_number, created_at) VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)',
-          [water_name, liters_per_jerrycan, 'empty', jerrycans_added, `STOCK-${water_name}-${liters_per_jerrycan}L-empty`]
-        );
-      }
-    }
-    
-    // Delete filled stock linked to this purchase - TWO METHODS:
-    // Method 1: Delete by reference_id
-    await pool.query('DELETE FROM water_jerrycans WHERE reference_id = ?', [id]);
-    
-    // Method 2: Also reduce quantity by matching attributes (in case reference_id wasn't set)
-    const [filledRows] = await pool.query(
-      'SELECT id, quantity FROM water_jerrycans WHERE water_name = ? AND capacity = ? AND status = ? AND reference_id IS NULL LIMIT 1',
-      [water_name, liters_per_jerrycan, status]
-    );
-    
-    if (filledRows.length > 0) {
-      const newQty = filledRows[0].quantity - jerrycans_added;
-      if (newQty <= 0) {
-        await pool.query('DELETE FROM water_jerrycans WHERE id = ?', [filledRows[0].id]);
-      } else {
-        await pool.query('UPDATE water_jerrycans SET quantity = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', [newQty, filledRows[0].id]);
+      if (stockRows.length > 0) {
+        const newQty = stockRows[0].quantity - jerrycans_added;
+        if (newQty <= 0) {
+          await pool.query('DELETE FROM water_jerrycans WHERE id = ?', [stockRows[0].id]);
+        } else {
+          await pool.query('UPDATE water_jerrycans SET quantity = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', [newQty, stockRows[0].id]);
+        }
       }
     }
     
@@ -1208,6 +1301,45 @@ router.get('/jerrycan-stats', async (req, res) => {
         empty: stats[0].empty_count || 0,
         inMaintenance: stats[0].maintenance || 0
       }
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// RESET stock when all data is deleted
+router.post('/reset-stock', async (req, res) => {
+  try {
+    const userId = req.headers['x-user-id'];
+    
+    // Check if there are any sales or purchases
+    const [salesCount] = await pool.query('SELECT COUNT(*) as count FROM water_sales');
+    const [purchasesCount] = await pool.query('SELECT COUNT(*) as count FROM water_additions');
+    
+    if (salesCount[0].count > 0 || purchasesCount[0].count > 0) {
+      return res.status(400).json({ 
+        error: 'Cannot reset stock. There are still sales or purchases in the system.' 
+      });
+    }
+    
+    // Delete all stock records
+    await pool.query('DELETE FROM water_jerrycans');
+    
+    if (userId) {
+      await logActivity({
+        userId: parseInt(userId),
+        actionType: 'delete',
+        entityType: 'stock_reset',
+        entityId: 0,
+        entityName: 'Stock Reset',
+        description: 'Yakomitse stock zose ku zero',
+        metadata: {}
+      });
+    }
+    
+    res.json({ 
+      success: true, 
+      message: 'Stock has been reset to zero' 
     });
   } catch (error) {
     res.status(500).json({ error: error.message });

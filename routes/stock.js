@@ -5,6 +5,22 @@ const { pool } = require('../config/database');
 // GET all stock with details
 router.get('/', async (req, res) => {
   try {
+    // First, get the overall profit from sales (to match Daily.tsx calculation)
+    // Get total revenue from sales
+    const [[revenueStats]] = await pool.query(`
+      SELECT COALESCE(SUM(final_amount), 0) as totalRevenue
+      FROM sales
+    `);
+    
+    // Get total cost from sale items
+    const [[costStats]] = await pool.query(`
+      SELECT COALESCE(SUM(si.quantity * COALESCE(i.cost, 0)), 0) as totalCost
+      FROM sale_items si
+      LEFT JOIN items i ON si.item_id = i.id
+    `);
+    
+    const overallProfit = (revenueStats.totalRevenue || 0) - (costStats.totalCost || 0);
+    
     const [stock] = await pool.query(`
       SELECT
         i.id,
@@ -38,7 +54,6 @@ router.get('/', async (req, res) => {
         COALESCE((
           SELECT SUM(si.quantity * si.unit_price)
           FROM sale_items si
-          JOIN sales sa ON si.sale_id = sa.id
           WHERE si.item_id = i.id
         ), 0)
         -
@@ -61,7 +76,12 @@ router.get('/', async (req, res) => {
       WHERE i.status = 'active'
       ORDER BY i.name
     `);
-    res.json(stock);
+    
+    // Add the overall profit to the response
+    res.json({
+      items: stock,
+      overallProfit: overallProfit
+    });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }

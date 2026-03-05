@@ -24,27 +24,49 @@ router.post('/', async (req, res) => {
     if (amount === undefined) return res.status(400).json({ error: 'Amount is required' });
     if (!paymentDate) return res.status(400).json({ error: 'Payment date is required' });
 
-    // Add installment
-    const [result] = await pool.query(
-      'INSERT INTO debt_installments (debt_id, amount, payment_date, notes) VALUES (?, ?, ?, ?)',
-      [debtId, amount, paymentDate, notes]
-    );
-
-    // Calculate total paid
-    const [[{ total_paid }]] = await pool.query(
-      'SELECT COALESCE(SUM(amount), 0) as total_paid FROM debt_installments WHERE debt_id = ?',
-      [debtId]
-    );
-
-    // Get debt amount + link to sale (if any)
+    // Get debt amount and current total paid
     const [[debtRow]] = await pool.query(
       'SELECT amount, description FROM debts WHERE id = ?',
       [debtId]
     );
     const debt_amount = debtRow?.amount;
 
-    // Update debt status
-    const newDebtStatus = total_paid >= debt_amount ? 'paid' : 'pending';
+    // Calculate current total paid (before this installment)
+    const [[{ current_total_paid }]] = await pool.query(
+      'SELECT COALESCE(SUM(amount), 0) as current_total_paid FROM debt_installments WHERE debt_id = ?',
+      [debtId]
+    );
+
+    // Calculate remaining balance
+    const remaining_balance = debt_amount - current_total_paid;
+
+    // Cap the installment amount at the remaining balance
+    const capped_amount = Math.min(parseFloat(amount), remaining_balance);
+
+    // Prevent overpayment
+    if (capped_amount <= 0) {
+      return res.status(400).json({ 
+        error: 'This debt is already fully paid. No additional payment needed.',
+        totalPaid: current_total_paid,
+        debtAmount: debt_amount
+      });
+    }
+
+    // Add installment with capped amount
+    const [result] = await pool.query(
+      'INSERT INTO debt_installments (debt_id, amount, payment_date, notes) VALUES (?, ?, ?, ?)',
+      [debtId, capped_amount, paymentDate, notes || (capped_amount < amount ? `Payment capped at remaining balance (original: ${amount})` : '')]
+    );
+
+    // Calculate new total paid
+    const total_paid = parseFloat(current_total_paid) + parseFloat(capped_amount);
+
+    // Update debt status - use a small epsilon for floating point comparison
+    const balance = debt_amount - total_paid;
+    const newDebtStatus = balance <= 0.01 ? 'paid' : 'pending';
+    
+    console.log(`Debt ${debtId}: amount=${debt_amount}, total_paid=${total_paid}, balance=${balance}, status=${newDebtStatus}`);
+    
     await pool.query(
       'UPDATE debts SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
       [newDebtStatus, debtId]

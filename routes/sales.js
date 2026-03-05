@@ -31,7 +31,39 @@ async function savePreviousStock(itemId, currentStock) {
 // GET all sales
 router.get('/', async (req, res) => {
   try {
-    const [sales] = await pool.query('SELECT * FROM sales ORDER BY created_at DESC');
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 40;
+    const offset = (page - 1) * limit;
+    const dateFilter = req.query.dateFilter || 'today';
+    
+    // Build date filter - default to today
+    let dateCondition = 'DATE(date) = CURDATE()';
+    switch (dateFilter) {
+      case 'today':
+        dateCondition = 'DATE(date) = CURDATE()';
+        break;
+      case 'yesterday':
+        dateCondition = 'DATE(date) = DATE_SUB(CURDATE(), INTERVAL 1 DAY)';
+        break;
+      case 'thisMonth':
+        dateCondition = 'MONTH(date) = MONTH(CURDATE()) AND YEAR(date) = YEAR(CURDATE())';
+        break;
+      case 'lastMonth':
+        dateCondition = 'MONTH(date) = MONTH(DATE_SUB(CURDATE(), INTERVAL 1 MONTH)) AND YEAR(date) = YEAR(DATE_SUB(CURDATE(), INTERVAL 1 MONTH))';
+        break;
+      case 'last7days':
+        dateCondition = 'DATE(date) >= DATE_SUB(CURDATE(), INTERVAL 7 DAY)';
+        break;
+      case 'all':
+        dateCondition = '1=1';
+        break;
+    }
+    
+    // Get total count
+    const [[{ total }]] = await pool.query(`SELECT COUNT(*) as total FROM sales WHERE ${dateCondition}`);
+    const totalPages = Math.ceil(total / limit);
+    
+    const [sales] = await pool.query(`SELECT * FROM sales WHERE ${dateCondition} ORDER BY created_at DESC LIMIT ? OFFSET ?`, [limit, offset]);
 
     const salesWithItems = [];
     for (const sale of sales) {
@@ -88,7 +120,66 @@ router.get('/', async (req, res) => {
       });
     }
 
-    res.json(salesWithItems);
+    // Calculate total stats for the filtered period
+    console.log('📊 Sales - Date filter:', dateFilter);
+    console.log('📊 Sales - Calculating stats with condition:', dateCondition);
+    
+    // Build date condition for joined queries (replace 'date' with 's.date')
+    const joinedDateCondition = dateCondition.replace(/DATE\(date\)/g, 'DATE(s.date)').replace(/MONTH\(date\)/g, 'MONTH(s.date)').replace(/YEAR\(date\)/g, 'YEAR(s.date)');
+    console.log('📊 Sales - Joined date condition:', joinedDateCondition);
+    
+    // Get total sales and total value
+    const [statsRows] = await pool.query(`
+      SELECT 
+        COUNT(*) as totalOrders,
+        COALESCE(SUM(final_amount), 0) as totalValue
+      FROM sales 
+      WHERE ${dateCondition}
+    `);
+    
+    // Get total items quantity
+    const [itemsRows] = await pool.query(`
+      SELECT COALESCE(SUM(si.quantity), 0) as totalItems
+      FROM sale_items si 
+      INNER JOIN sales s ON si.sale_id = s.id
+      WHERE ${joinedDateCondition}
+    `);
+    
+    // Get total cost (sum of item_cost * quantity for all items in the period)
+    const [costRows] = await pool.query(`
+      SELECT COALESCE(SUM(si.quantity * COALESCE(i.cost, 0)), 0) as totalCost
+      FROM sale_items si
+      INNER JOIN sales s ON si.sale_id = s.id
+      LEFT JOIN items i ON si.item_id = i.id
+      WHERE ${joinedDateCondition}
+    `);
+    
+    const totalStats = {
+      totalOrders: statsRows[0].totalOrders,
+      totalValue: statsRows[0].totalValue,
+      totalItems: itemsRows[0].totalItems,
+      totalCost: costRows[0].totalCost
+    };
+    console.log('📈 Sales - Total stats result:', totalStats);
+    console.log('📈 Sales - Calculated profit (totalValue - totalCost):', parseFloat(totalStats.totalValue) - parseFloat(totalStats.totalCost));
+
+    res.json({
+      data: salesWithItems,
+      pagination: { 
+        page, 
+        limit, 
+        total, 
+        totalPages, 
+        hasNext: page < totalPages, 
+        hasPrev: page > 1,
+        stats: {
+          totalOrders: parseInt(totalStats.totalOrders) || 0,
+          totalValue: parseFloat(totalStats.totalValue) || 0,
+          totalItems: parseInt(totalStats.totalItems) || 0,
+          totalCost: parseFloat(totalStats.totalCost) || 0
+        }
+      }
+    });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
