@@ -3,11 +3,181 @@ const router = express.Router();
 const { pool } = require('../config/database');
 const { logActivity } = require('../utils/activityLogger');
 
+// Auto-migrate: Create water_bottle_items table and add required columns
+(async () => {
+  try {
+    // Create water_bottle_items table if it doesn't exist
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS water_bottle_items (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        water_name VARCHAR(100) NOT NULL,
+        capacity_liters DECIMAL(10, 2) NOT NULL DEFAULT 1.0,
+        bottle_type VARCHAR(50) NOT NULL DEFAULT 'plastic',
+        buying_price DECIMAL(10, 2) NOT NULL DEFAULT 0,
+        selling_price DECIMAL(10, 2) NOT NULL DEFAULT 0,
+        bottle_cost DECIMAL(10, 2) NOT NULL DEFAULT 0,
+        filled_stock INT NOT NULL DEFAULT 0,
+        empty_stock INT NOT NULL DEFAULT 0,
+        min_stock INT NOT NULL DEFAULT 5,
+        status ENUM('active', 'inactive') DEFAULT 'active',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+      )
+    `);
+    console.log('✅ water_bottle_items table ready');
+  } catch (err) {
+    console.log('water_bottle_items migration:', err.message);
+  }
+})();
+
+// ============================================================
+// BOTTLE ITEMS CRUD
+// ============================================================
+
+// GET all bottle items
+router.get('/bottle-items', async (req, res) => {
+  try {
+    const [rows] = await pool.query(`
+      SELECT *, (filled_stock + empty_stock) as total_stock,
+             (filled_stock * buying_price) as total_investment
+      FROM water_bottle_items
+      ORDER BY created_at DESC
+    `);
+    res.json({ success: true, data: rows });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// GET single bottle item
+router.get('/bottle-items/:id', async (req, res) => {
+  try {
+    const [rows] = await pool.query(
+      'SELECT *, (filled_stock + empty_stock) as total_stock FROM water_bottle_items WHERE id = ?',
+      [req.params.id]
+    );
+    if (rows.length === 0) return res.status(404).json({ success: false, error: 'Item not found' });
+    res.json({ success: true, data: rows[0] });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// POST create bottle item
+router.post('/bottle-items', async (req, res) => {
+  try {
+    const {
+      water_name, capacity_liters, bottle_type,
+      buying_price, selling_price, bottle_cost,
+      filled_stock = 0, empty_stock = 0, min_stock = 5, status = 'active'
+    } = req.body;
+
+    if (!water_name) return res.status(400).json({ success: false, error: 'water_name is required' });
+    if (!capacity_liters) return res.status(400).json({ success: false, error: 'capacity_liters is required' });
+
+    const [result] = await pool.query(
+      `INSERT INTO water_bottle_items
+        (water_name, capacity_liters, bottle_type, buying_price, selling_price, bottle_cost, filled_stock, empty_stock, min_stock, status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [water_name, capacity_liters, bottle_type || 'plastic', buying_price, selling_price, bottle_cost, filled_stock, empty_stock, min_stock, status]
+    );
+
+    const [newItem] = await pool.query('SELECT * FROM water_bottle_items WHERE id = ?', [result.insertId]);
+    res.status(201).json({ success: true, data: newItem[0] });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// PUT update bottle item
+router.put('/bottle-items/:id', async (req, res) => {
+  try {
+    const {
+      water_name, capacity_liters, bottle_type,
+      buying_price, selling_price, bottle_cost,
+      filled_stock, empty_stock, min_stock, status
+    } = req.body;
+
+    const [existing] = await pool.query('SELECT id FROM water_bottle_items WHERE id = ?', [req.params.id]);
+    if (existing.length === 0) return res.status(404).json({ success: false, error: 'Item not found' });
+
+    await pool.query(
+      `UPDATE water_bottle_items SET
+        water_name = ?, capacity_liters = ?, bottle_type = ?,
+        buying_price = ?, selling_price = ?, bottle_cost = ?,
+        filled_stock = ?, empty_stock = ?, min_stock = ?, status = ?
+       WHERE id = ?`,
+      [water_name, capacity_liters, bottle_type || 'plastic', buying_price, selling_price, bottle_cost,
+       filled_stock, empty_stock, min_stock || 5, status || 'active', req.params.id]
+    );
+
+    const [updated] = await pool.query(
+      'SELECT *, (filled_stock + empty_stock) as total_stock FROM water_bottle_items WHERE id = ?',
+      [req.params.id]
+    );
+    res.json({ success: true, data: updated[0] });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// DELETE bottle item
+router.delete('/bottle-items/:id', async (req, res) => {
+  try {
+    const [existing] = await pool.query('SELECT id FROM water_bottle_items WHERE id = ?', [req.params.id]);
+    if (existing.length === 0) return res.status(404).json({ success: false, error: 'Item not found' });
+
+    // Check if this item has been used in any water sales
+    const [salesCheck] = await pool.query(
+      'SELECT COUNT(*) as sale_count FROM water_sales WHERE water_bottle_item_id = ?',
+      [req.params.id]
+    );
+
+    if (salesCheck[0]?.sale_count > 0) {
+      return res.status(400).json({
+        success: false,
+        error: `Cannot delete this item. It has been used in ${salesCheck[0].sale_count} water sales. Items that have been sold cannot be deleted.`
+      });
+    }
+
+    // Check if this item has been used in any water purchases
+    const [purchaseCheck] = await pool.query(
+      'SELECT COUNT(*) as purchase_count FROM water_additions WHERE water_bottle_item_id = ?',
+      [req.params.id]
+    );
+
+    if (purchaseCheck[0]?.purchase_count > 0) {
+      return res.status(400).json({
+        success: false,
+        error: `Cannot delete this item. It has been used in ${purchaseCheck[0].purchase_count} water purchases. Items with purchase history cannot be deleted.`
+      });
+    }
+
+    await pool.query('DELETE FROM water_bottle_items WHERE id = ?', [req.params.id]);
+    res.json({ success: true, message: 'Bottle item deleted successfully' });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ============================================================
+// END BOTTLE ITEMS CRUD
+// ============================================================
+
 // Auto-migrate: Add required columns and consolidate to quantity-based
 (async () => {
   try {
     await pool.query(`ALTER TABLE water_additions ADD COLUMN IF NOT EXISTS bottle_price DECIMAL(10, 2) DEFAULT 0`);
+    await pool.query(`ALTER TABLE water_additions ADD COLUMN IF NOT EXISTS purchase_type ENUM('water', 'bottles') DEFAULT 'water'`);
+    await pool.query(`ALTER TABLE water_additions ADD COLUMN IF NOT EXISTS water_bottle_item_id INT NULL`);
+    await pool.query(`ALTER TABLE water_additions ADD COLUMN IF NOT EXISTS empty_bottles_returned INT DEFAULT 0`);
     await pool.query(`ALTER TABLE water_additions ADD COLUMN IF NOT EXISTS status ENUM('filled', 'empty') DEFAULT 'filled'`);
+
+    // Ensure water_bottle_items has all required stock columns
+    await pool.query(`ALTER TABLE water_bottle_items ADD COLUMN IF NOT EXISTS filled_stock INT DEFAULT 0`);
+    await pool.query(`ALTER TABLE water_bottle_items ADD COLUMN IF NOT EXISTS empty_stock INT DEFAULT 0`);
+    await pool.query(`ALTER TABLE water_bottle_items ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP`);
+    console.log('[migration] water_bottle_items columns ensured');
     
     // Add quantity column to water_jerrycans if it doesn't exist
     await pool.query(`ALTER TABLE water_jerrycans ADD COLUMN IF NOT EXISTS quantity INT DEFAULT 1`);
@@ -21,6 +191,9 @@ const { logActivity } = require('../utils/activityLogger');
     // Add water_price and bottle_price_sold columns to water_sales for accurate profit tracking
     await pool.query(`ALTER TABLE water_sales ADD COLUMN IF NOT EXISTS water_price DECIMAL(10, 2) DEFAULT 0`);
     await pool.query(`ALTER TABLE water_sales ADD COLUMN IF NOT EXISTS bottle_price_sold DECIMAL(10, 2) DEFAULT 0`);
+    await pool.query(`ALTER TABLE water_sales ADD COLUMN IF NOT EXISTS water_bottle_item_id INT NULL`);
+    await pool.query(`ALTER TABLE water_sales ADD COLUMN IF NOT EXISTS sale_type ENUM('water_only','water_with_exchange','bottle_only') NULL`);
+    await pool.query(`ALTER TABLE water_sales ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT 'Paid'`);
     
     // Check if we need to consolidate (if there are many rows with quantity=1)
     const [checkRows] = await pool.query(`SELECT COUNT(*) as cnt FROM water_jerrycans WHERE quantity = 1`);
@@ -172,13 +345,30 @@ router.get('/sales', async (req, res) => {
     }
     
     let query = `
-      SELECT s.*, 
+      SELECT s.*,
+             COALESCE(s.sale_type, CASE
+               WHEN s.customer_brings_bottle = 1 THEN 'water_with_exchange'
+               WHEN s.includes_bottle = 1 AND (s.water_price IS NULL OR s.water_price = 0) THEN 'bottle_only'
+               WHEN s.includes_bottle = 1 THEN 'water_only'
+               ELSE 'bottle_only'
+             END) AS sale_type,
              a.supplier_name as purchase_supplier,
              a.buying_price_per_jerrycan as purchase_water_cost,
              a.bottle_price as purchase_bottle_cost,
-             a.date as purchase_date
+             a.date as purchase_date,
+             COALESCE(wbi.bottle_cost, 0) as item_bottle_cost,
+             CASE
+               WHEN s.customer_brings_bottle = 1
+                 THEN (COALESCE(s.water_price, s.price_per_jerrycan) - COALESCE(a.buying_price_per_jerrycan, 0)) * s.jerrycans_sold
+               WHEN s.includes_bottle = 1 AND (s.water_price IS NULL OR s.water_price = 0)
+                 THEN (s.price_per_jerrycan - COALESCE(wbi.bottle_cost, 0)) * s.jerrycans_sold
+               WHEN s.includes_bottle = 1
+                 THEN ((COALESCE(s.water_price, 0) + COALESCE(s.bottle_price_sold, 0)) - (COALESCE(a.buying_price_per_jerrycan, 0) + COALESCE(a.bottle_price, 0))) * s.jerrycans_sold
+               ELSE (s.price_per_jerrycan - COALESCE(wbi.bottle_cost, 0)) * s.jerrycans_sold
+             END AS profit
       FROM water_sales s
       LEFT JOIN water_additions a ON s.purchase_id = a.id
+      LEFT JOIN water_bottle_items wbi ON s.water_bottle_item_id = wbi.id
     `;
     let params = [];
     
@@ -201,11 +391,42 @@ router.get('/sales', async (req, res) => {
     
     const [sales] = await pool.query(query, params);
     
+    // Add debt information for each sale
+    const salesWithDebtInfo = [];
+    for (const sale of sales) {
+      const saleFinalAmount = Number(sale.total_amount) || 0;
+      let paid_so_far = sale.status === 'Paid' ? saleFinalAmount : 0;
+      let balance = Math.max(0, saleFinalAmount - paid_so_far);
+
+      // Check for linked debt
+      const [linkedDebts] = await pool.query(
+        "SELECT id, amount FROM debts WHERE type = 'debtor' AND description = ? LIMIT 1",
+        [`Sale #${sale.id}`]
+      );
+
+      if (linkedDebts.length > 0) {
+        const debt = linkedDebts[0];
+        const [[{ total_paid }]] = await pool.query(
+          'SELECT COALESCE(SUM(amount), 0) as total_paid FROM debt_installments WHERE debt_id = ?',
+          [debt.id]
+        );
+        const debtAmount = Number(debt.amount) || 0;
+        paid_so_far = Number(total_paid) || 0;
+        balance = Math.max(0, debtAmount - paid_so_far);
+      }
+
+      salesWithDebtInfo.push({
+        ...sale,
+        paid_so_far,
+        balance
+      });
+    }
+    
     // Calculate summary using stored profit values
-    const totalLiters = sales.reduce((sum, sale) => sum + (sale.jerrycans_sold * (sale.capacity || 20)), 0);
-    const totalRevenue = sales.reduce((sum, sale) => sum + parseFloat(sale.total_amount || 0), 0);
-    const totalProfit = sales.reduce((sum, sale) => sum + parseFloat(sale.profit || 0), 0);
-    const salesCount = sales.length;
+    const totalLiters = salesWithDebtInfo.reduce((sum, sale) => sum + (sale.jerrycans_sold * (sale.capacity || 20)), 0);
+    const totalRevenue = salesWithDebtInfo.reduce((sum, sale) => sum + parseFloat(sale.total_amount || 0), 0);
+    const totalProfit = salesWithDebtInfo.reduce((sum, sale) => sum + parseFloat(sale.profit || 0), 0);
+    const salesCount = salesWithDebtInfo.length;
 
     const summary = {
       totalLiters,
@@ -217,7 +438,7 @@ router.get('/sales', async (req, res) => {
     res.json({
       success: true,
       data: {
-        sales,
+        sales: salesWithDebtInfo,
         summary
       }
     });
@@ -230,13 +451,22 @@ router.get('/sales', async (req, res) => {
 router.post('/sales', async (req, res) => {
   try {
     const userId = req.headers['x-user-id'];
-    const { jerrycans_sold, price_per_jerrycan, customer_name, payment_method, notes, water_name, capacity, customer_brings_bottle, includes_bottle, water_price, bottle_price } = req.body;
+    const { jerrycans_sold, price_per_jerrycan, customer_name, payment_method, notes, water_name, capacity, customer_brings_bottle, includes_bottle, water_price, bottle_price, water_bottle_item_id, empty_bottles_returned = 0, sale_type, paid_amount } = req.body;
 
     if (!jerrycans_sold || !price_per_jerrycan) {
       return res.status(400).json({ error: 'Jerrycans sold and price per jerrycan are required' });
     }
 
     const total_amount = jerrycans_sold * price_per_jerrycan;
+    
+    // Handle payment amounts and status
+    const normalizedFinalAmount = Number(total_amount) || 0;
+    const rawPaidAmount = paid_amount === undefined || paid_amount === null
+      ? (payment_method === 'Loan' ? 0 : normalizedFinalAmount)
+      : Number(paid_amount);
+    const normalizedPaidAmount = Math.max(0, Math.min(normalizedFinalAmount, Number.isFinite(rawPaidAmount) ? rawPaidAmount : 0));
+    const normalizedStatus = normalizedPaidAmount >= normalizedFinalAmount ? 'Paid' : 'Partial';
+    const remainingAmount = Math.max(0, normalizedFinalAmount - normalizedPaidAmount);
     const custName = customer_name && String(customer_name).trim() ? String(customer_name).trim() : 'Client';
     const wName = water_name && String(water_name).trim() ? String(water_name).trim() : null;
     const cap = capacity != null ? parseInt(capacity, 10) : null;
@@ -247,20 +477,58 @@ router.post('/sales', async (req, res) => {
     const saleWaterPrice = parseFloat(water_price) || 0;
     const saleBottlePrice = parseFloat(bottle_price) || 0;
 
-    // Find filled stock for this product (quantity-based)
-    const [stockRows] = await pool.query(
-      'SELECT id, COALESCE(quantity, 1) as quantity, reference_id FROM water_jerrycans WHERE status = ? AND water_name = ? AND capacity = ? LIMIT 1',
-      ['filled', wName || 'Water', cap || 20]
-    );
-    
-    if (stockRows.length === 0 || stockRows[0].quantity < jerrycans_sold) {
-      const available = stockRows.length > 0 ? stockRows[0].quantity : 0;
-      return res.status(400).json({ error: `Amacupa ahari ni ${available} gusa` });
+    // For bottle_only sales, skip filled stock check entirely
+    let stockId = null, currentQty = 0, purchaseId = null;
+    if (sale_type !== 'bottle_only') {
+      // If water_bottle_item_id is provided, check stock from water_bottle_items table
+      if (water_bottle_item_id) {
+        console.log(`[STOCK CHECK] Using water_bottle_item_id: ${water_bottle_item_id}`);
+        
+        const [itemRows] = await pool.query(
+          'SELECT id, water_name, capacity_liters, filled_stock, empty_stock FROM water_bottle_items WHERE id = ?',
+          [water_bottle_item_id]
+        );
+        
+        if (itemRows.length === 0) {
+          return res.status(400).json({ error: 'Water item not found' });
+        }
+        
+        const item = itemRows[0];
+        const availableFilled = item.filled_stock || 0;
+        
+        console.log(`[STOCK CHECK] Item found: ${item.water_name} ${item.capacity_liters}L, filled_stock: ${availableFilled}`);
+        
+        if (availableFilled < jerrycans_sold) {
+          return res.status(400).json({ error: `Amacupa ahari ni ${availableFilled} gusa` });
+        }
+        
+        // For water_bottle_items, we use the item ID as stockId
+        stockId = water_bottle_item_id;
+        currentQty = availableFilled;
+        // Note: water_bottle_items don't have reference_id, set to null
+        purchaseId = null;
+        
+      } else {
+        // Fallback to old water_jerrycans logic for legacy sales
+        const searchWaterName = wName || 'Water';
+        const searchCapacity = cap || 20;
+        console.log(`[STOCK CHECK] Fallback: Searching water_jerrycans for: water_name='${searchWaterName}', capacity=${searchCapacity}`);
+        
+        const [stockRows] = await pool.query(
+          'SELECT id, COALESCE(quantity, 1) as quantity, reference_id FROM water_jerrycans WHERE status = ? AND water_name = ? AND capacity = ? LIMIT 1',
+          ['filled', searchWaterName, searchCapacity]
+        );
+        
+        if (stockRows.length === 0 || stockRows[0].quantity < jerrycans_sold) {
+          const available = stockRows.length > 0 ? stockRows[0].quantity : 0;
+          return res.status(400).json({ error: `Amacupa ahari ni ${available} gusa` });
+        }
+        
+        stockId = stockRows[0].id;
+        currentQty = stockRows[0].quantity;
+        purchaseId = stockRows[0].reference_id;
+      }
     }
-
-    const stockId = stockRows[0].id;
-    const currentQty = stockRows[0].quantity;
-    const purchaseId = stockRows[0].reference_id;
     
     // Get purchase costs to calculate profit
     let buyingPricePerJerrycan = 0;
@@ -274,6 +542,17 @@ router.post('/sales', async (req, res) => {
       if (purchaseRows.length > 0) {
         buyingPricePerJerrycan = parseFloat(purchaseRows[0].buying_price_per_jerrycan) || 0;
         purchaseBottlePrice = parseFloat(purchaseRows[0].bottle_price) || 0;
+      }
+    }
+
+    // For bottle_only, get bottle_cost from water_bottle_items (no purchaseId available)
+    if (sale_type === 'bottle_only' && water_bottle_item_id) {
+      const [itemRows] = await pool.query(
+        'SELECT bottle_cost FROM water_bottle_items WHERE id = ?',
+        [water_bottle_item_id]
+      );
+      if (itemRows.length > 0) {
+        purchaseBottlePrice = parseFloat(itemRows[0].bottle_cost) || 0;
       }
     }
     
@@ -294,43 +573,102 @@ router.post('/sales', async (req, res) => {
 
     // Create sale record with purchase_id and calculated profit
     const [result] = await pool.query(
-      'INSERT INTO water_sales (water_name, capacity, jerrycans_sold, price_per_jerrycan, total_amount, profit, customer_name, payment_method, notes, customer_brings_bottle, includes_bottle, purchase_id, water_price, bottle_price_sold) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-      [wName || 'Water', cap || 20, jerrycans_sold, price_per_jerrycan, total_amount, profit, custName, payment_method || 'cash', notes || '', customerBringsBottle, includesBottle, purchaseId, saleWaterPrice, saleBottlePrice]
+      'INSERT INTO water_sales (water_name, capacity, jerrycans_sold, price_per_jerrycan, total_amount, profit, customer_name, payment_method, notes, customer_brings_bottle, includes_bottle, purchase_id, water_price, bottle_price_sold, sale_type, water_bottle_item_id, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      [wName || 'Water', cap || 20, jerrycans_sold, price_per_jerrycan, total_amount, profit, custName, payment_method || 'cash', notes || '', customerBringsBottle, includesBottle, purchaseId, saleWaterPrice, saleBottlePrice, sale_type || null, water_bottle_item_id || null, normalizedStatus]
     );
 
-    // Handle bottle inventory based on whether customer takes bottle or brings their own
-    if (includesBottle && !customerBringsBottle) {
-      // Customer takes the bottle (buys it) - reduce filled quantity
-      const newQty = currentQty - jerrycans_sold;
-      if (newQty <= 0) {
-        await pool.query('DELETE FROM water_jerrycans WHERE id = ?', [stockId]);
-      } else {
-        await pool.query('UPDATE water_jerrycans SET quantity = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', [newQty, stockId]);
-      }
-    } else {
-      // Customer brings their own bottle (swaps) - reduce filled, add to empty
-      const newFilledQty = currentQty - jerrycans_sold;
-      if (newFilledQty <= 0) {
-        await pool.query('DELETE FROM water_jerrycans WHERE id = ?', [stockId]);
-      } else {
-        await pool.query('UPDATE water_jerrycans SET quantity = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', [newFilledQty, stockId]);
-      }
-      
-      // Add to empty stock
-      const [emptyRows] = await pool.query(
-        'SELECT id, quantity FROM water_jerrycans WHERE status = ? AND water_name = ? AND capacity = ? LIMIT 1',
-        ['empty', wName || 'Water', cap || 20]
+    const saleId = result.insertId;
+
+    // Create debt record + initial installment for partial/loan sales
+    let debtId = null;
+    if (remainingAmount > 0 && custName !== 'Client') {
+      const due = new Date();
+      due.setDate(due.getDate() + 30);
+      const dueDate = due.toISOString().split('T')[0];
+
+      const debtDescription = `Sale #${saleId}`;
+      const [debtResult] = await pool.query(
+        'INSERT INTO debts (type, person, amount, date, due_date, description, status, phone, email) VALUES (?, ?, ?, CURDATE(), ?, ?, ?, ?, ?)',
+        ['debtor', custName, normalizedFinalAmount, dueDate, debtDescription, 'pending', '', '']
       );
-      
-      if (emptyRows.length > 0) {
-        await pool.query('UPDATE water_jerrycans SET quantity = quantity + ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', [jerrycans_sold, emptyRows[0].id]);
-      } else {
-        // Create empty stock record with unique serial_number
-        const uniqueSerial = `STOCK-${wName || 'Water'}-${cap || 20}L-empty-${Date.now()}`;
+      debtId = debtResult.insertId;
+
+      // Add initial payment if any
+      if (normalizedPaidAmount > 0) {
         await pool.query(
-          'INSERT INTO water_jerrycans (water_name, capacity, status, serial_number, selling_price, quantity, created_at) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)',
-          [wName || 'Water', cap || 20, 'empty', uniqueSerial, 0, jerrycans_sold]
+          'INSERT INTO debt_installments (debt_id, amount, payment_date, notes) VALUES (?, ?, CURDATE(), ?)',
+          [debtId, normalizedPaidAmount, `Initial payment for Sale #${saleId}`]
         );
+      }
+    }
+
+    // Handle water_jerrycans stock — skip entirely for bottle_only
+    if (sale_type !== 'bottle_only' && stockId) {
+      if (includesBottle && !customerBringsBottle) {
+        const newQty = currentQty - jerrycans_sold;
+        if (newQty <= 0) {
+          await pool.query('DELETE FROM water_jerrycans WHERE id = ?', [stockId]);
+        } else {
+          await pool.query('UPDATE water_jerrycans SET quantity = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', [newQty, stockId]);
+        }
+      } else {
+        const newFilledQty = currentQty - jerrycans_sold;
+        if (newFilledQty <= 0) {
+          await pool.query('DELETE FROM water_jerrycans WHERE id = ?', [stockId]);
+        } else {
+          await pool.query('UPDATE water_jerrycans SET quantity = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', [newFilledQty, stockId]);
+        }
+        const [emptyRows] = await pool.query(
+          'SELECT id, quantity FROM water_jerrycans WHERE status = ? AND water_name = ? AND capacity = ? LIMIT 1',
+          ['empty', wName || 'Water', cap || 20]
+        );
+        if (emptyRows.length > 0) {
+          await pool.query('UPDATE water_jerrycans SET quantity = quantity + ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', [jerrycans_sold, emptyRows[0].id]);
+        } else {
+          const uniqueSerial = `STOCK-${wName || 'Water'}-${cap || 20}L-empty-${Date.now()}`;
+          await pool.query(
+            'INSERT INTO water_jerrycans (water_name, capacity, status, serial_number, selling_price, quantity, created_at) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)',
+            [wName || 'Water', cap || 20, 'empty', uniqueSerial, 0, jerrycans_sold]
+          );
+        }
+      }
+    }
+
+    // Update water_bottle_items stock based on sale_type
+    console.log(`[STOCK UPDATE] water_bottle_item_id: ${water_bottle_item_id}, sale_type: ${sale_type}`);
+    if (water_bottle_item_id) {
+      const saleType = sale_type;
+      if (saleType === 'water_only') {
+        // AMAZI + ICUPA: customer takes both water + bottle → filled_stock- ONLY
+        await pool.query(
+          `UPDATE water_bottle_items SET
+            filled_stock = GREATEST(0, filled_stock - ?),
+            updated_at = CURRENT_TIMESTAMP
+          WHERE id = ?`,
+          [jerrycans_sold, water_bottle_item_id]
+        );
+        console.log(`[sale] AMAZI+ICUPA (water_only) → filled_stock -${jerrycans_sold}`);
+      } else if (saleType === 'water_with_exchange') {
+        // AMAZI: customer brings bottle, gets water, leaves empty → filled_stock-, empty_stock+
+        await pool.query(
+          `UPDATE water_bottle_items SET
+            filled_stock = GREATEST(0, filled_stock - ?),
+            empty_stock = empty_stock + ?,
+            updated_at = CURRENT_TIMESTAMP
+          WHERE id = ?`,
+          [jerrycans_sold, jerrycans_sold, water_bottle_item_id]
+        );
+        console.log(`[sale] AMAZI (water_with_exchange) → filled_stock -${jerrycans_sold}, empty_stock +${jerrycans_sold}`);
+      } else if (saleType === 'bottle_only') {
+        // Sell empty bottle only → empty_stock-
+        await pool.query(
+          `UPDATE water_bottle_items SET
+            empty_stock = GREATEST(0, empty_stock - ?),
+            updated_at = CURRENT_TIMESTAMP
+          WHERE id = ?`,
+          [jerrycans_sold, water_bottle_item_id]
+        );
+        console.log(`[sale] bottle_only → empty_stock -${jerrycans_sold}`);
       }
     }
 
@@ -363,9 +701,69 @@ router.post('/sales', async (req, res) => {
         notes: notes || '',
         customer_brings_bottle: customerBringsBottle,
         includes_bottle: includesBottle,
-        purchase_id: purchaseId
+        purchase_id: purchaseId,
+        status: normalizedStatus,
+        paid_amount: normalizedPaidAmount,
+        remaining_amount: remainingAmount,
+        debt_id: debtId
       }
     });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// UPDATE water sale status (for debt sync)
+router.patch('/sales/:id/status', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status } = req.body;
+
+    if (!status || (status !== 'Paid' && status !== 'Partial')) {
+      return res.status(400).json({ error: 'Invalid status' });
+    }
+
+    await pool.query('UPDATE water_sales SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', [status, id]);
+
+    // Sync linked debt(s) created from this water sale
+    const saleId = parseInt(id);
+    if (!Number.isNaN(saleId)) {
+      const [linkedDebts] = await pool.query(
+        "SELECT id, amount FROM debts WHERE type = 'debtor' AND description = ?",
+        [`Sale #${saleId}`]
+      );
+
+      for (const debt of linkedDebts) {
+        const [[{ total_paid }]] = await pool.query(
+          'SELECT COALESCE(SUM(amount), 0) as total_paid FROM debt_installments WHERE debt_id = ?',
+          [debt.id]
+        );
+        const debtAmount = Number(debt.amount) || 0;
+        const paid = Number(total_paid) || 0;
+        const balance = Math.max(0, debtAmount - paid);
+
+        if (status === 'Paid') {
+          if (balance > 0) {
+            await pool.query(
+              'INSERT INTO debt_installments (debt_id, amount, payment_date, notes) VALUES (?, ?, CURDATE(), ?)',
+              [debt.id, balance, `Auto close from Water Sale #${saleId} marked Paid`]
+            );
+          }
+          await pool.query(
+            "UPDATE debts SET status = 'paid', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            [debt.id]
+          );
+        } else {
+          const computedStatus = paid >= debtAmount ? 'paid' : 'pending';
+          await pool.query(
+            'UPDATE debts SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+            [computedStatus, debt.id]
+          );
+        }
+      }
+    }
+
+    res.json({ success: true, id, status });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -608,17 +1006,35 @@ router.delete('/sales/:id', async (req, res) => {
       capacity, 
       jerrycans_sold, 
       purchase_id, 
+      sale_type,
       includes_bottle, 
-      customer_brings_bottle 
+      customer_brings_bottle,
+      water_bottle_item_id,
+      water_price,
+      bottle_price_sold
     } = sale;
+    
+    // Derive sale_type if not set (for old records)
+    let actualSaleType = sale_type;
+    if (!actualSaleType) {
+      if (!includes_bottle) {
+        actualSaleType = 'water_with_exchange'; // AMAZI: no bottle involved
+      } else if (includes_bottle && !customer_brings_bottle && parseFloat(water_price || 0) === 0) {
+        actualSaleType = 'bottle_only'; // ICUPA: has bottle, no water price
+      } else if (includes_bottle && !customer_brings_bottle) {
+        actualSaleType = 'water_only'; // AMAZI + ICUPA: has bottle + water price
+      } else {
+        actualSaleType = 'water_with_exchange'; // AMAZI swap
+      }
+    }
     
     console.log(`[DELETE SALE] Sale details:`, {
       water_name,
       capacity,
       jerrycans_sold,
       purchase_id,
-      includes_bottle,
-      customer_brings_bottle
+      sale_type: actualSaleType,
+      water_bottle_item_id
     });
     
     // Get current stock BEFORE restoration
@@ -628,42 +1044,94 @@ router.delete('/sales/:id', async (req, res) => {
     );
     console.log(`[DELETE SALE] Stock BEFORE restoration:`, stockBefore);
     
-    // RESTORE WATER BACK TO STOCK based on transaction type
-    if (includes_bottle && !customer_brings_bottle) {
-      // Customer bought the bottle - restore to filled stock
-      console.log(`[DELETE SALE] Restoring ${jerrycans_sold} to FILLED stock (customer took bottle)`);
-      await restoreToStock(water_name, capacity, jerrycans_sold, 'filled');
-    } else {
-      // Customer brought their own bottle or it was a swap
-      console.log(`[DELETE SALE] Water-only sale - removing from empty, restoring to filled`);
-      
-      // Remove from empty stock (if exists)
-      const [emptyRows] = await pool.query(
-        'SELECT id, quantity FROM water_jerrycans WHERE water_name = ? AND capacity = ? AND status = "empty" LIMIT 1',
-        [water_name, capacity]
-      );
-      
-      console.log(`[DELETE SALE] Empty stock found:`, emptyRows);
-      
-      if (emptyRows.length > 0) {
-        const currentEmptyQty = emptyRows[0].quantity;
-        if (currentEmptyQty <= jerrycans_sold) {
-          console.log(`[DELETE SALE] Deleting empty stock record (qty ${currentEmptyQty} <= ${jerrycans_sold})`);
-          await pool.query('DELETE FROM water_jerrycans WHERE id = ?', [emptyRows[0].id]);
-        } else {
-          console.log(`[DELETE SALE] Reducing empty stock by ${jerrycans_sold}`);
-          await pool.query(
-            'UPDATE water_jerrycans SET quantity = quantity - ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
-            [jerrycans_sold, emptyRows[0].id]
-          );
+    // RESTORE STOCK based on sale_type
+    switch (actualSaleType) {
+      case 'water_only': // AMAZI + ICUPA (customer took filled water + bottle)
+        console.log(`[DELETE SALE] AMAZI + ICUPA: Restoring ${jerrycans_sold} to FILLED stock ONLY`);
+        await restoreToStock(water_name, capacity, jerrycans_sold, 'filled');
+        break;
+        
+      case 'water_with_exchange': // AMAZI (customer brought bottle, took water, left empty)
+        console.log(`[DELETE SALE] AMAZI: Restoring ${jerrycans_sold} to FILLED stock AND removing EMPTY stock we gained`);
+        
+        // Remove the empty stock we gained from the original sale
+        const [emptyRows] = await pool.query(
+          'SELECT id, quantity FROM water_jerrycans WHERE water_name = ? AND capacity = ? AND status = "empty" LIMIT 1',
+          [water_name, capacity]
+        );
+        
+        if (emptyRows.length > 0) {
+          const currentEmptyQty = emptyRows[0].quantity;
+          if (currentEmptyQty <= jerrycans_sold) {
+            console.log(`[DELETE SALE] Removing empty stock record (qty ${currentEmptyQty} <= ${jerrycans_sold})`);
+            await pool.query('DELETE FROM water_jerrycans WHERE id = ?', [emptyRows[0].id]);
+          } else {
+            console.log(`[DELETE SALE] Reducing empty stock by ${jerrycans_sold} (removing gained empties)`);
+            await pool.query(
+              'UPDATE water_jerrycans SET quantity = quantity - ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+              [jerrycans_sold, emptyRows[0].id]
+            );
+          }
         }
-      }
-      
-      // Add to filled stock
-      console.log(`[DELETE SALE] Restoring ${jerrycans_sold} to FILLED stock`);
-      await restoreToStock(water_name, capacity, jerrycans_sold, 'filled');
+        
+        // Restore the filled stock
+        await restoreToStock(water_name, capacity, jerrycans_sold, 'filled');
+        break;
+        
+      case 'bottle_only': // ICUPA (customer took empty bottles only)
+        console.log(`[DELETE SALE] ICUPA: Restoring ${jerrycans_sold} to EMPTY stock`);
+        await restoreToStock(water_name, capacity, jerrycans_sold, 'empty');
+        break;
+        
+      default:
+        console.log(`[DELETE SALE] Unknown sale_type: ${actualSaleType}, using legacy logic`);
+        // Fallback to legacy logic
+        if (includes_bottle && !customer_brings_bottle) {
+          await restoreToStock(water_name, capacity, jerrycans_sold, 'filled');
+        } else {
+          await restoreToStock(water_name, capacity, jerrycans_sold, 'filled');
+        }
     }
     
+    // RESTORE water_bottle_items stock — use water_bottle_item_id if set, else find by water_name+capacity
+    let wbiId = water_bottle_item_id;
+    if (!wbiId) {
+      const [wbiRows] = await pool.query(
+        'SELECT id FROM water_bottle_items WHERE water_name = ? AND CAST(capacity_liters AS UNSIGNED) = ? LIMIT 1',
+        [water_name, parseInt(capacity)]
+      );
+      console.log(`[DELETE SALE] wbi lookup: water_name=${water_name}, capacity=${capacity}, found:`, wbiRows);
+      if (wbiRows.length > 0) wbiId = wbiRows[0].id;
+    }
+    if (wbiId) {
+      console.log(`[DELETE SALE] Restoring water_bottle_items ID: ${wbiId}, type: ${actualSaleType}`);
+      switch (actualSaleType) {
+        case 'water_only':
+          await pool.query(
+            'UPDATE water_bottle_items SET filled_stock = filled_stock + ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+            [jerrycans_sold, wbiId]
+          );
+          console.log(`[DELETE SALE] AMAZI+ICUPA: filled_stock +${jerrycans_sold}`);
+          break;
+        case 'water_with_exchange':
+          await pool.query(
+            'UPDATE water_bottle_items SET filled_stock = filled_stock + ?, empty_stock = GREATEST(0, empty_stock - ?), updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+            [jerrycans_sold, jerrycans_sold, wbiId]
+          );
+          console.log(`[DELETE SALE] AMAZI: filled_stock +${jerrycans_sold}, empty_stock -${jerrycans_sold}`);
+          break;
+        case 'bottle_only':
+          await pool.query(
+            'UPDATE water_bottle_items SET empty_stock = empty_stock + ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+            [jerrycans_sold, wbiId]
+          );
+          console.log(`[DELETE SALE] ICUPA: empty_stock +${jerrycans_sold}`);
+          break;
+      }
+    } else {
+      console.log(`[DELETE SALE] WARNING: No water_bottle_items record found for ${water_name} ${capacity}L`);
+    }
+
     // Get current stock AFTER restoration
     const [stockAfter] = await pool.query(
       'SELECT * FROM water_jerrycans WHERE water_name = ? AND capacity = ?',
@@ -701,10 +1169,207 @@ router.delete('/sales/:id', async (req, res) => {
       success: true, 
       message: 'Sale deleted and water restored to stock',
       restored_jerrycans: jerrycans_sold,
-      purchase_updated: purchase_id ? true : false
+      purchase_updated: purchase_id ? true : false,
+      sale_type: actualSaleType
     });
     
   } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// BULK DELETE water sales - Enhanced with proper stock restoration
+router.delete('/sales/bulk', async (req, res) => {
+  try {
+    const userId = req.headers['x-user-id'];
+    const { sale_ids } = req.body;
+    
+    if (!sale_ids || !Array.isArray(sale_ids) || sale_ids.length === 0) {
+      return res.status(400).json({ error: 'sale_ids array is required' });
+    }
+    
+    console.log(`[BULK DELETE] Starting bulk delete for ${sale_ids.length} sales:`, sale_ids);
+    
+    const results = [];
+    let successCount = 0;
+    let failedCount = 0;
+    
+    // Process each sale individually to ensure proper stock restoration
+    for (const saleId of sale_ids) {
+      try {
+        // Get sale details
+        const [saleRows] = await pool.query('SELECT * FROM water_sales WHERE id = ?', [saleId]);
+        
+        if (saleRows.length === 0) {
+          results.push({ id: saleId, success: false, error: 'Sale not found' });
+          failedCount++;
+          continue;
+        }
+        
+        const sale = saleRows[0];
+        const { 
+          water_name, 
+          capacity, 
+          jerrycans_sold, 
+          purchase_id, 
+          sale_type,
+          includes_bottle, 
+          customer_brings_bottle,
+          water_bottle_item_id,
+          water_price,
+          bottle_price_sold
+        } = sale;
+        
+        // Derive sale_type if not set (for old records)
+        let actualSaleType = sale_type;
+        if (!actualSaleType) {
+          if (!includes_bottle) {
+            actualSaleType = 'water_with_exchange'; // AMAZI: no bottle involved
+          } else if (includes_bottle && !customer_brings_bottle && parseFloat(water_price || 0) === 0) {
+            actualSaleType = 'bottle_only'; // ICUPA: has bottle, no water price
+          } else if (includes_bottle && !customer_brings_bottle) {
+            actualSaleType = 'water_only'; // AMAZI + ICUPA: has bottle + water price
+          } else {
+            actualSaleType = 'water_with_exchange'; // AMAZI swap
+          }
+        }
+        
+        console.log(`[BULK DELETE] Processing sale ${saleId} - type: ${actualSaleType}, qty: ${jerrycans_sold}, water_bottle_item_id: ${water_bottle_item_id}`);
+        
+        // RESTORE STOCK based on sale_type
+        switch (actualSaleType) {
+          case 'water_only': // AMAZI + ICUPA (customer took filled water + bottle)
+            await restoreToStock(water_name, capacity, jerrycans_sold, 'filled');
+            break;
+            
+          case 'water_with_exchange': // AMAZI (customer brought bottle, took water, left empty)
+            // Remove the empty stock we gained from the original sale
+            const [emptyRows] = await pool.query(
+              'SELECT id, quantity FROM water_jerrycans WHERE water_name = ? AND capacity = ? AND status = "empty" LIMIT 1',
+              [water_name, capacity]
+            );
+            
+            if (emptyRows.length > 0) {
+              const currentEmptyQty = emptyRows[0].quantity;
+              if (currentEmptyQty <= jerrycans_sold) {
+                await pool.query('DELETE FROM water_jerrycans WHERE id = ?', [emptyRows[0].id]);
+              } else {
+                await pool.query(
+                  'UPDATE water_jerrycans SET quantity = quantity - ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+                  [jerrycans_sold, emptyRows[0].id]
+                );
+              }
+            }
+            
+            // Restore the filled stock
+            await restoreToStock(water_name, capacity, jerrycans_sold, 'filled');
+            break;
+            
+          case 'bottle_only': // ICUPA (customer took empty bottles only)
+            await restoreToStock(water_name, capacity, jerrycans_sold, 'empty');
+            break;
+            
+          default:
+            // Fallback to legacy logic
+            await restoreToStock(water_name, capacity, jerrycans_sold, 'filled');
+        }
+        
+        // RESTORE water_bottle_items stock — use water_bottle_item_id if set, else find by water_name+capacity
+        let wbiId = water_bottle_item_id;
+        if (!wbiId) {
+          const [wbiRows] = await pool.query(
+            'SELECT id FROM water_bottle_items WHERE water_name = ? AND CAST(capacity_liters AS UNSIGNED) = ? LIMIT 1',
+            [water_name, parseInt(capacity)]
+          );
+          console.log(`[BULK DELETE] wbi lookup: water_name=${water_name}, capacity=${capacity}, found:`, wbiRows);
+          if (wbiRows.length > 0) wbiId = wbiRows[0].id;
+        }
+        if (wbiId) {
+          console.log(`[BULK DELETE] Restoring water_bottle_items ID: ${wbiId}, type: ${actualSaleType}`);
+          switch (actualSaleType) {
+            case 'water_only':
+              await pool.query(
+                'UPDATE water_bottle_items SET filled_stock = filled_stock + ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+                [jerrycans_sold, wbiId]
+              );
+              console.log(`[BULK DELETE] AMAZI+ICUPA: filled_stock +${jerrycans_sold}`);
+              break;
+            case 'water_with_exchange':
+              await pool.query(
+                'UPDATE water_bottle_items SET filled_stock = filled_stock + ?, empty_stock = GREATEST(0, empty_stock - ?), updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+                [jerrycans_sold, jerrycans_sold, wbiId]
+              );
+              console.log(`[BULK DELETE] AMAZI: filled_stock +${jerrycans_sold}, empty_stock -${jerrycans_sold}`);
+              break;
+            case 'bottle_only':
+              await pool.query(
+                'UPDATE water_bottle_items SET empty_stock = empty_stock + ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+                [jerrycans_sold, wbiId]
+              );
+              console.log(`[BULK DELETE] ICUPA: empty_stock +${jerrycans_sold}`);
+              break;
+          }
+        } else {
+          console.log(`[BULK DELETE] WARNING: No water_bottle_items record found for ${water_name} ${capacity}L`);
+        }
+        
+        // UPDATE PURCHASE RECORD IF purchase_id EXISTS
+        if (purchase_id) {
+          await pool.query(
+            'UPDATE water_additions SET jerrycans_added = jerrycans_added + ?, total_liters = total_liters + (? * ?), updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+            [jerrycans_sold, jerrycans_sold, capacity, purchase_id]
+          );
+        }
+        
+        // Delete the sale
+        await pool.query('DELETE FROM water_sales WHERE id = ?', [saleId]);
+        
+        if (userId) {
+          await logActivity({
+            userId: parseInt(userId),
+            actionType: 'delete',
+            entityType: 'water_sale',
+            entityId: parseInt(saleId),
+            entityName: `Water Sale #${saleId}`,
+            description: `yasibiye igurisha amazi #${saleId} (yagaruriye ${jerrycans_sold} jerrycans - ${actualSaleType})`,
+            metadata: { 
+              jerrycans_sold, 
+              sale_type: actualSaleType,
+              water_name,
+              capacity,
+              purchase_id
+            }
+          });
+        }
+        
+        results.push({ 
+          id: saleId, 
+          success: true, 
+          restored_jerrycans: jerrycans_sold,
+          sale_type: actualSaleType 
+        });
+        successCount++;
+        
+      } catch (saleError) {
+        console.error(`[BULK DELETE] Error deleting sale ${saleId}:`, saleError);
+        results.push({ id: saleId, success: false, error: saleError.message });
+        failedCount++;
+      }
+    }
+    
+    console.log(`[BULK DELETE] Completed: ${successCount} success, ${failedCount} failed`);
+    
+    res.json({ 
+      success: true, 
+      message: `Bulk delete completed: ${successCount} deleted, ${failedCount} failed`,
+      total_processed: sale_ids.length,
+      success_count: successCount,
+      failed_count: failedCount,
+      results
+    });
+    
+  } catch (error) {
+    console.error('[BULK DELETE] Error:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -765,7 +1430,7 @@ router.get('/additions', async (req, res) => {
       waterNameFilter = 'water_name = ?';
     }
     
-    let query = 'SELECT id, water_name, status, jerrycans_added, liters_per_jerrycan, total_liters, buying_price_per_jerrycan, selling_price_per_jerrycan, COALESCE(bottle_price, 0) as bottle_price, total_buying_cost AS total_cost, total_selling_price, expected_profit, supplier_name, date, created_at, updated_at FROM water_additions';
+    let query = 'SELECT id, water_name, status, jerrycans_added, liters_per_jerrycan, total_liters, buying_price_per_jerrycan, selling_price_per_jerrycan, COALESCE(bottle_price, 0) as bottle_price, total_buying_cost AS total_cost, total_selling_price, expected_profit, supplier_name, date, COALESCE(purchase_type, IF(status=\'empty\',\'bottles\',\'water\')) as purchase_type, water_bottle_item_id, COALESCE(empty_bottles_returned, 0) as empty_bottles_returned, created_at, updated_at FROM water_additions';
     
     // Combine filters
     const filters = [];
@@ -802,7 +1467,10 @@ router.post('/additions', async (req, res) => {
       bottle_price = 0,
       bottle_health = 'good',
       supplier_name,
-      date
+      date,
+      purchase_type,
+      water_bottle_item_id,
+      empty_bottles_returned = 0
     } = req.body;
 
     if (!jerrycans_added || !liters_per_jerrycan) {
@@ -836,8 +1504,8 @@ router.post('/additions', async (req, res) => {
 
     // 1. FIRST create the purchase record
     const [result] = await pool.query(
-      'INSERT INTO water_additions (water_name, status, jerrycans_added, liters_per_jerrycan, total_liters, buying_price_per_jerrycan, selling_price_per_jerrycan, bottle_price, total_buying_cost, total_selling_price, expected_profit, supplier_name, date) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-      [wName, jerrycanStatus, jerrycans_added, liters_per_jerrycan, total_liters, buying, selling, bottlePrice, total_buying_cost, total_selling_price, expected_profit, supplier_name || '', dateVal]
+      'INSERT INTO water_additions (water_name, status, jerrycans_added, liters_per_jerrycan, total_liters, buying_price_per_jerrycan, selling_price_per_jerrycan, bottle_price, total_buying_cost, total_selling_price, expected_profit, supplier_name, date, purchase_type, water_bottle_item_id, empty_bottles_returned) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      [wName, jerrycanStatus, jerrycans_added, liters_per_jerrycan, total_liters, buying, selling, bottlePrice, total_buying_cost, total_selling_price, expected_profit, supplier_name || '', dateVal, purchase_type || (jerrycanStatus === 'empty' ? 'bottles' : 'water'), water_bottle_item_id || null, empty_bottles_returned || 0]
     );
 
     const purchaseId = result.insertId;
@@ -889,6 +1557,35 @@ router.post('/additions', async (req, res) => {
         'INSERT INTO water_jerrycans (water_name, capacity, status, serial_number, selling_price, bottle_price, bottle_health, quantity, reference_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)',
         [wName, liters_per_jerrycan, jerrycanStatus, uniqueSerial, selling, bottlePrice, health, jerrycans_added, purchaseId]
       );
+    }
+
+    // 4. Update water_bottle_items stock to reflect the purchase
+    console.log(`[purchase] water_bottle_item_id=${water_bottle_item_id}, jerrycanStatus=${jerrycanStatus}, jerrycans_added=${jerrycans_added}, empty_bottles_returned=${empty_bottles_returned}`);
+    if (water_bottle_item_id) {
+      if (jerrycanStatus === 'filled') {
+        // Kugura Amazi: filled_stock increases, empty_stock decreases by returned amount
+        const [upd] = await pool.query(
+          `UPDATE water_bottle_items SET
+            filled_stock = filled_stock + ?,
+            empty_stock = GREATEST(0, empty_stock - ?),
+            updated_at = CURRENT_TIMESTAMP
+          WHERE id = ?`,
+          [jerrycans_added, empty_bottles_returned || 0, water_bottle_item_id]
+        );
+        console.log(`[purchase] filled water → filled_stock +${jerrycans_added}, empty_stock -${empty_bottles_returned || 0}, affectedRows=${upd.affectedRows}`);
+      } else {
+        // Kugura Amacupa: empty_stock increases
+        const [upd] = await pool.query(
+          `UPDATE water_bottle_items SET
+            empty_stock = empty_stock + ?,
+            updated_at = CURRENT_TIMESTAMP
+          WHERE id = ?`,
+          [jerrycans_added, water_bottle_item_id]
+        );
+        console.log(`[purchase] empty bottles → empty_stock +${jerrycans_added}, affectedRows=${upd.affectedRows}`);
+      }
+    } else {
+      console.log(`[purchase] WARNING: no water_bottle_item_id sent — water_bottle_items NOT updated`);
     }
 
     if (userId) {
@@ -1052,14 +1749,19 @@ router.delete('/additions/:id', async (req, res) => {
     }
     
     const purchase = purchaseRows[0];
+    console.log(`[DELETE PURCHASE] Raw record:`, JSON.stringify(purchase));
     const { 
       water_name, 
       capacity, 
       status, 
       liters_per_jerrycan,
       selling_price_per_jerrycan,
-      bottle_price 
+      bottle_price,
+      water_bottle_item_id,
+      purchase_type,
+      empty_bottles_returned
     } = purchase;
+    console.log(`[DELETE PURCHASE] water_bottle_item_id=${water_bottle_item_id}, purchase_type=${purchase_type}, status=${status}, jerrycans_added=${purchase.jerrycans_added}, empty_bottles_returned=${empty_bottles_returned}`);
     
     // Check if any sales reference this purchase
     const [salesCheck] = await pool.query(
@@ -1103,6 +1805,49 @@ router.delete('/additions/:id', async (req, res) => {
       }
     }
     
+    // REVERSE water_bottle_items stock — exact reverse of POST /additions
+    let wbiId = water_bottle_item_id;
+    if (!wbiId) {
+      const [wbiRows] = await pool.query(
+        'SELECT id FROM water_bottle_items WHERE water_name = ? AND CAST(capacity_liters AS UNSIGNED) = ? LIMIT 1',
+        [water_name, parseInt(liters_per_jerrycan || capacity)]
+      );
+      console.log(`[DELETE PURCHASE] Fallback lookup: water_name=${water_name}, capacity=${parseInt(liters_per_jerrycan || capacity)}, found:`, wbiRows);
+      if (wbiRows.length > 0) wbiId = wbiRows[0].id;
+    }
+    if (wbiId) {
+      // Get stock BEFORE update
+      const [beforeStock] = await pool.query('SELECT filled_stock, empty_stock FROM water_bottle_items WHERE id = ?', [wbiId]);
+      console.log(`[DELETE PURCHASE] BEFORE: item ${wbiId} - filled=${beforeStock[0]?.filled_stock}, empty=${beforeStock[0]?.empty_stock}`);
+      
+      const isBottlePurchase = purchase_type === 'bottles' || status === 'empty';
+      console.log(`[DELETE PURCHASE] isBottlePurchase=${isBottlePurchase} (purchase_type=${purchase_type}, status=${status})`);
+      
+      if (isBottlePurchase) {
+        // Kugura Amacupa reverse: empty_stock was increased, so decrease it back
+        const [result] = await pool.query(
+          'UPDATE water_bottle_items SET empty_stock = GREATEST(0, empty_stock - ?), updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+          [jerrycans_added, wbiId]
+        );
+        console.log(`[DELETE PURCHASE] Bottles: empty_stock -${jerrycans_added} on item ${wbiId}, affectedRows=${result.affectedRows}`);
+      } else {
+        // Kugura Amazi reverse: filled_stock was increased AND empty_stock was decreased
+        // So: filled_stock -qty, empty_stock +empty_bottles_returned
+        const returned = parseInt(empty_bottles_returned) || jerrycans_added;
+        const [result] = await pool.query(
+          'UPDATE water_bottle_items SET filled_stock = GREATEST(0, filled_stock - ?), empty_stock = empty_stock + ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+          [jerrycans_added, returned, wbiId]
+        );
+        console.log(`[DELETE PURCHASE] Water: filled_stock -${jerrycans_added}, empty_stock +${returned} on item ${wbiId}, affectedRows=${result.affectedRows}`);
+      }
+      
+      // Get stock AFTER update
+      const [afterStock] = await pool.query('SELECT filled_stock, empty_stock FROM water_bottle_items WHERE id = ?', [wbiId]);
+      console.log(`[DELETE PURCHASE] AFTER: item ${wbiId} - filled=${afterStock[0]?.filled_stock}, empty=${afterStock[0]?.empty_stock}`);
+    } else {
+      console.log(`[DELETE PURCHASE] WARNING: No water_bottle_items found for ${water_name} ${liters_per_jerrycan}L`);
+    }
+
     // Delete the purchase
     await pool.query('DELETE FROM water_additions WHERE id = ?', [id]);
     
@@ -1342,6 +2087,204 @@ router.post('/reset-stock', async (req, res) => {
       message: 'Stock has been reset to zero' 
     });
   } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================
+// BOTTLE ITEMS (Product Catalog) ROUTES
+// ============================================
+
+// GET all bottle items
+router.get('/bottle-items', async (req, res) => {
+  try {
+    // Create table if it doesn't exist
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS water_bottle_items (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        water_name VARCHAR(255) NOT NULL,
+        capacity_liters DECIMAL(10, 2) NOT NULL,
+        bottle_type VARCHAR(100) DEFAULT 'Jerrycan',
+        buying_price DECIMAL(10, 2) DEFAULT 0,
+        selling_price DECIMAL(10, 2) DEFAULT 0,
+        bottle_cost DECIMAL(10, 2) DEFAULT 0,
+        min_stock INT DEFAULT 5,
+        status ENUM('active', 'inactive') DEFAULT 'active',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+      )
+    `);
+
+    // Get bottle items with calculated stock from water_jerrycans
+    const [items] = await pool.query(`
+      SELECT 
+        bi.*,
+        COALESCE(SUM(CASE WHEN wj.status = 'filled' THEN wj.quantity ELSE 0 END), 0) as filled_stock,
+        COALESCE(SUM(CASE WHEN wj.status = 'empty' THEN wj.quantity ELSE 0 END), 0) as empty_stock,
+        COALESCE(SUM(wj.quantity), 0) as total_stock,
+        COALESCE(SUM(CASE WHEN wj.status = 'filled' THEN wj.quantity ELSE 0 END), 0) * (bi.buying_price + bi.bottle_cost) as total_investment
+      FROM water_bottle_items bi
+      LEFT JOIN water_jerrycans wj ON wj.water_name = bi.water_name AND wj.capacity = bi.capacity_liters
+      GROUP BY bi.id
+      ORDER BY bi.created_at DESC
+    `);
+
+    res.json({ success: true, data: items });
+  } catch (error) {
+    console.error('Error fetching bottle items:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// CREATE bottle item
+router.post('/bottle-items', async (req, res) => {
+  try {
+    const userId = req.headers['x-user-id'];
+    const {
+      water_name,
+      capacity_liters,
+      bottle_type = 'Jerrycan',
+      buying_price = 0,
+      selling_price = 0,
+      bottle_cost = 0,
+      min_stock = 5,
+      status = 'active'
+    } = req.body;
+
+    if (!water_name || !capacity_liters) {
+      return res.status(400).json({ error: 'Water name and capacity are required' });
+    }
+
+    // Create table if it doesn't exist
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS water_bottle_items (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        water_name VARCHAR(255) NOT NULL,
+        capacity_liters DECIMAL(10, 2) NOT NULL,
+        bottle_type VARCHAR(100) DEFAULT 'Jerrycan',
+        buying_price DECIMAL(10, 2) DEFAULT 0,
+        selling_price DECIMAL(10, 2) DEFAULT 0,
+        bottle_cost DECIMAL(10, 2) DEFAULT 0,
+        min_stock INT DEFAULT 5,
+        status ENUM('active', 'inactive') DEFAULT 'active',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+      )
+    `);
+
+    const [result] = await pool.query(
+      'INSERT INTO water_bottle_items (water_name, capacity_liters, bottle_type, buying_price, selling_price, bottle_cost, min_stock, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+      [water_name, capacity_liters, bottle_type, buying_price, selling_price, bottle_cost, min_stock, status]
+    );
+
+    if (userId) {
+      await logActivity({
+        userId: parseInt(userId),
+        actionType: 'create',
+        entityType: 'water_bottle_item',
+        entityId: result.insertId,
+        entityName: `${water_name} ${capacity_liters}L`,
+        description: `yongeremo ubwoko bw'amacupa: ${water_name} ${capacity_liters}L`,
+        metadata: { water_name, capacity_liters, bottle_type }
+      });
+    }
+
+    res.json({
+      success: true,
+      data: {
+        id: result.insertId,
+        water_name,
+        capacity_liters,
+        bottle_type,
+        buying_price,
+        selling_price,
+        bottle_cost,
+        min_stock,
+        status
+      }
+    });
+  } catch (error) {
+    console.error('Error creating bottle item:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// UPDATE bottle item
+router.put('/bottle-items/:id', async (req, res) => {
+  try {
+    const userId = req.headers['x-user-id'];
+    const { id } = req.params;
+    const {
+      water_name,
+      capacity_liters,
+      bottle_type,
+      buying_price,
+      selling_price,
+      bottle_cost,
+      min_stock,
+      status
+    } = req.body;
+
+    if (!water_name || !capacity_liters) {
+      return res.status(400).json({ error: 'Water name and capacity are required' });
+    }
+
+    await pool.query(
+      'UPDATE water_bottle_items SET water_name = ?, capacity_liters = ?, bottle_type = ?, buying_price = ?, selling_price = ?, bottle_cost = ?, min_stock = ?, status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+      [water_name, capacity_liters, bottle_type, buying_price, selling_price, bottle_cost, min_stock, status, id]
+    );
+
+    if (userId) {
+      await logActivity({
+        userId: parseInt(userId),
+        actionType: 'update',
+        entityType: 'water_bottle_item',
+        entityId: parseInt(id),
+        entityName: `${water_name} ${capacity_liters}L`,
+        description: `yahuje ubwoko bw'amacupa: ${water_name} ${capacity_liters}L`,
+        metadata: { water_name, capacity_liters, bottle_type }
+      });
+    }
+
+    res.json({ success: true, message: 'Bottle item updated successfully' });
+  } catch (error) {
+    console.error('Error updating bottle item:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// DELETE bottle item
+router.delete('/bottle-items/:id', async (req, res) => {
+  try {
+    const userId = req.headers['x-user-id'];
+    const { id } = req.params;
+
+    // Get item details before deleting
+    const [items] = await pool.query('SELECT * FROM water_bottle_items WHERE id = ?', [id]);
+    
+    if (items.length === 0) {
+      return res.status(404).json({ error: 'Bottle item not found' });
+    }
+
+    const item = items[0];
+
+    await pool.query('DELETE FROM water_bottle_items WHERE id = ?', [id]);
+
+    if (userId) {
+      await logActivity({
+        userId: parseInt(userId),
+        actionType: 'delete',
+        entityType: 'water_bottle_item',
+        entityId: parseInt(id),
+        entityName: `${item.water_name} ${item.capacity_liters}L`,
+        description: `yasibe ubwoko bw'amacupa: ${item.water_name} ${item.capacity_liters}L`,
+        metadata: { water_name: item.water_name, capacity_liters: item.capacity_liters }
+      });
+    }
+
+    res.json({ success: true, message: 'Bottle item deleted successfully' });
+  } catch (error) {
+    console.error('Error deleting bottle item:', error);
     res.status(500).json({ error: error.message });
   }
 });

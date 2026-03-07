@@ -47,6 +47,13 @@ router.get('/', async (req, res) => {
       case 'all':
         dateCondition = '1=1';
         break;
+      case 'custom':
+        if (req.query.startDate && req.query.endDate) {
+          dateCondition = `DATE(date) BETWEEN '${req.query.startDate}' AND '${req.query.endDate}'`;
+        } else {
+          dateCondition = '1=1';
+        }
+        break;
     }
     
     console.log('🔍 Purchase orders - SQL condition:', dateCondition);

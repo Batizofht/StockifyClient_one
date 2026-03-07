@@ -72,14 +72,17 @@ router.post('/', async (req, res) => {
       [newDebtStatus, debtId]
     );
 
-    // If this debt came from a sale, sync the sale status
+    // If this debt came from a sale, sync the sale status (regular sales and water sales)
     const desc = (debtRow?.description || '').toString();
     const match = desc.match(/^Sale\s*#(\d+)$/i);
     if (match) {
       const saleId = parseInt(match[1]);
       if (!Number.isNaN(saleId)) {
         const newSaleStatus = total_paid >= debt_amount ? 'Paid' : 'Partial';
+        // Update regular sales
         await pool.query('UPDATE sales SET status = ? WHERE id = ?', [newSaleStatus, saleId]);
+        // Also update water sales (in case it's a water sale)
+        await pool.query('UPDATE water_sales SET status = ? WHERE id = ?', [newSaleStatus, saleId]);
       }
     }
 
@@ -138,14 +141,17 @@ router.delete('/:id', async (req, res) => {
       [newStatus, debtId]
     );
 
-    // If this debt came from a sale, sync the sale status
+    // If this debt came from a sale, sync the sale status (regular sales and water sales)
     const desc = (debtRow?.description || '').toString();
     const match = desc.match(/^Sale\s*#(\d+)$/i);
     if (match) {
       const saleId = parseInt(match[1]);
       if (!Number.isNaN(saleId)) {
         const newSaleStatus = total_paid >= debt_amount ? 'Paid' : 'Partial';
+        // Update regular sales
         await pool.query('UPDATE sales SET status = ? WHERE id = ?', [newSaleStatus, saleId]);
+        // Also update water sales (in case it's a water sale)
+        await pool.query('UPDATE water_sales SET status = ? WHERE id = ?', [newSaleStatus, saleId]);
       }
     }
 
