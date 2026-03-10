@@ -8,13 +8,14 @@ const { logActivity } = require('../utils/activityLogger');
   try {
     // Create water_bottle_items table if it doesn't exist
     await pool.query(`
-      CREATE TABLE IF NOT EXISTS water_bottle_items (
+      CREATE TABLE  water_bottle_items (
         id INT AUTO_INCREMENT PRIMARY KEY,
         water_name VARCHAR(100) NOT NULL,
         capacity_liters DECIMAL(10, 2) NOT NULL DEFAULT 1.0,
         bottle_type VARCHAR(50) NOT NULL DEFAULT 'plastic',
         buying_price DECIMAL(10, 2) NOT NULL DEFAULT 0,
         selling_price DECIMAL(10, 2) NOT NULL DEFAULT 0,
+        bottle_selling_price DECIMAL(10, 2) NOT NULL DEFAULT 0,
         bottle_cost DECIMAL(10, 2) NOT NULL DEFAULT 0,
         filled_stock INT NOT NULL DEFAULT 0,
         empty_stock INT NOT NULL DEFAULT 0,
@@ -68,7 +69,7 @@ router.post('/bottle-items', async (req, res) => {
   try {
     const {
       water_name, capacity_liters, bottle_type,
-      buying_price, selling_price, bottle_cost,
+      buying_price, selling_price, bottle_selling_price, bottle_cost,
       filled_stock = 0, empty_stock = 0, min_stock = 5, status = 'active'
     } = req.body;
 
@@ -77,9 +78,9 @@ router.post('/bottle-items', async (req, res) => {
 
     const [result] = await pool.query(
       `INSERT INTO water_bottle_items
-        (water_name, capacity_liters, bottle_type, buying_price, selling_price, bottle_cost, filled_stock, empty_stock, min_stock, status)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [water_name, capacity_liters, bottle_type || 'plastic', buying_price, selling_price, bottle_cost, filled_stock, empty_stock, min_stock, status]
+        (water_name, capacity_liters, bottle_type, buying_price, selling_price, bottle_selling_price, bottle_cost, filled_stock, empty_stock, min_stock, status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [water_name, capacity_liters, bottle_type || 'plastic', buying_price, selling_price, bottle_selling_price, bottle_cost, filled_stock, empty_stock, min_stock, status]
     );
 
     const [newItem] = await pool.query('SELECT * FROM water_bottle_items WHERE id = ?', [result.insertId]);
@@ -94,7 +95,7 @@ router.put('/bottle-items/:id', async (req, res) => {
   try {
     const {
       water_name, capacity_liters, bottle_type,
-      buying_price, selling_price, bottle_cost,
+      buying_price, selling_price, bottle_selling_price, bottle_cost,
       filled_stock, empty_stock, min_stock, status
     } = req.body;
 
@@ -104,10 +105,10 @@ router.put('/bottle-items/:id', async (req, res) => {
     await pool.query(
       `UPDATE water_bottle_items SET
         water_name = ?, capacity_liters = ?, bottle_type = ?,
-        buying_price = ?, selling_price = ?, bottle_cost = ?,
+        buying_price = ?, selling_price = ?, bottle_selling_price = ?, bottle_cost = ?,
         filled_stock = ?, empty_stock = ?, min_stock = ?, status = ?
        WHERE id = ?`,
-      [water_name, capacity_liters, bottle_type || 'plastic', buying_price, selling_price, bottle_cost,
+      [water_name, capacity_liters, bottle_type || 'plastic', buying_price, selling_price, bottle_selling_price, bottle_cost,
        filled_stock, empty_stock, min_stock || 5, status || 'active', req.params.id]
     );
 
@@ -167,33 +168,34 @@ router.delete('/bottle-items/:id', async (req, res) => {
 // Auto-migrate: Add required columns and consolidate to quantity-based
 (async () => {
   try {
-    await pool.query(`ALTER TABLE water_additions ADD COLUMN IF NOT EXISTS bottle_price DECIMAL(10, 2) DEFAULT 0`);
-    await pool.query(`ALTER TABLE water_additions ADD COLUMN IF NOT EXISTS purchase_type ENUM('water', 'bottles') DEFAULT 'water'`);
-    await pool.query(`ALTER TABLE water_additions ADD COLUMN IF NOT EXISTS water_bottle_item_id INT NULL`);
-    await pool.query(`ALTER TABLE water_additions ADD COLUMN IF NOT EXISTS empty_bottles_returned INT DEFAULT 0`);
-    await pool.query(`ALTER TABLE water_additions ADD COLUMN IF NOT EXISTS status ENUM('filled', 'empty') DEFAULT 'filled'`);
+    await pool.query(`ALTER TABLE water_additions ADD COLUMN  bottle_price DECIMAL(10, 2) DEFAULT 0`);
+    await pool.query(`ALTER TABLE water_additions ADD COLUMN  purchase_type ENUM('water', 'bottles') DEFAULT 'water'`);
+    await pool.query(`ALTER TABLE water_additions ADD COLUMN  water_bottle_item_id INT NULL`);
+    await pool.query(`ALTER TABLE water_additions ADD COLUMN  empty_bottles_returned INT DEFAULT 0`);
+    await pool.query(`ALTER TABLE water_additions ADD COLUMN  status ENUM('filled', 'empty') DEFAULT 'filled'`);
 
     // Ensure water_bottle_items has all required stock columns
-    await pool.query(`ALTER TABLE water_bottle_items ADD COLUMN IF NOT EXISTS filled_stock INT DEFAULT 0`);
-    await pool.query(`ALTER TABLE water_bottle_items ADD COLUMN IF NOT EXISTS empty_stock INT DEFAULT 0`);
-    await pool.query(`ALTER TABLE water_bottle_items ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP`);
+    await pool.query(`ALTER TABLE water_bottle_items ADD COLUMN  filled_stock INT DEFAULT 0`);
+    await pool.query(`ALTER TABLE water_bottle_items ADD COLUMN  empty_stock INT DEFAULT 0`);
+    await pool.query(`ALTER TABLE water_bottle_items ADD COLUMN  bottle_selling_price DECIMAL(10, 2) NOT NULL DEFAULT 0`);
+    await pool.query(`ALTER TABLE water_bottle_items ADD COLUMN  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP`);
     console.log('[migration] water_bottle_items columns ensured');
     
     // Add quantity column to water_jerrycans if it doesn't exist
-    await pool.query(`ALTER TABLE water_jerrycans ADD COLUMN IF NOT EXISTS quantity INT DEFAULT 1`);
+    await pool.query(`ALTER TABLE water_jerrycans ADD COLUMN  quantity INT DEFAULT 1`);
     
     // Add purchase_id to water_sales for tracking
-    await pool.query(`ALTER TABLE water_sales ADD COLUMN IF NOT EXISTS purchase_id INT NULL`);
+    await pool.query(`ALTER TABLE water_sales ADD COLUMN  purchase_id INT NULL`);
     
     // Add reference_id to water_jerrycans for linking to purchases
-    await pool.query(`ALTER TABLE water_jerrycans ADD COLUMN IF NOT EXISTS reference_id INT NULL`);
+    await pool.query(`ALTER TABLE water_jerrycans ADD COLUMN  reference_id INT NULL`);
     
     // Add water_price and bottle_price_sold columns to water_sales for accurate profit tracking
-    await pool.query(`ALTER TABLE water_sales ADD COLUMN IF NOT EXISTS water_price DECIMAL(10, 2) DEFAULT 0`);
-    await pool.query(`ALTER TABLE water_sales ADD COLUMN IF NOT EXISTS bottle_price_sold DECIMAL(10, 2) DEFAULT 0`);
-    await pool.query(`ALTER TABLE water_sales ADD COLUMN IF NOT EXISTS water_bottle_item_id INT NULL`);
-    await pool.query(`ALTER TABLE water_sales ADD COLUMN IF NOT EXISTS sale_type ENUM('water_only','water_with_exchange','bottle_only') NULL`);
-    await pool.query(`ALTER TABLE water_sales ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT 'Paid'`);
+    await pool.query(`ALTER TABLE water_sales ADD COLUMN  water_price DECIMAL(10, 2) DEFAULT 0`);
+    await pool.query(`ALTER TABLE water_sales ADD COLUMN  bottle_price_sold DECIMAL(10, 2) DEFAULT 0`);
+    await pool.query(`ALTER TABLE water_sales ADD COLUMN  water_bottle_item_id INT NULL`);
+    await pool.query(`ALTER TABLE water_sales ADD COLUMN  sale_type ENUM('water_only','water_with_exchange','bottle_only') NULL`);
+    await pool.query(`ALTER TABLE water_sales ADD COLUMN  status VARCHAR(20) DEFAULT 'Paid'`);
     
     // Check if we need to consolidate (if there are many rows with quantity=1)
     const [checkRows] = await pool.query(`SELECT COUNT(*) as cnt FROM water_jerrycans WHERE quantity = 1`);
@@ -203,7 +205,7 @@ router.delete('/bottle-items/:id', async (req, res) => {
       console.log('🔄 Consolidating water_jerrycans rows...');
       // Consolidate rows by water_name, capacity, status
       await pool.query(`
-        CREATE TEMPORARY TABLE IF NOT EXISTS temp_consolidated AS
+        CREATE TEMPORARY TABLE  temp_consolidated AS
         SELECT 
           COALESCE(water_name, 'Water') as water_name,
           capacity,
@@ -345,30 +347,108 @@ router.get('/sales', async (req, res) => {
     }
     
     let query = `
-      SELECT s.*,
-             COALESCE(s.sale_type, CASE
+SELECT s.*,
+       COALESCE(s.sale_type, CASE
+         WHEN s.customer_brings_bottle = 1 THEN 'water_with_exchange'
+         WHEN s.includes_bottle = 1 AND (s.water_price IS NULL OR s.water_price = 0) THEN 'bottle_only'
+         WHEN s.includes_bottle = 1 THEN 'water_only'
+         ELSE 'bottle_only'
+       END) AS sale_type,
+       a.supplier_name as purchase_supplier,
+       a.buying_price_per_jerrycan as purchase_water_cost,
+       a.bottle_price as purchase_bottle_cost,
+       a.date as purchase_date,
+       COALESCE(wbi.bottle_cost, 0) as item_bottle_cost,
+       CASE
+         WHEN COALESCE(s.sale_type, CASE
+           WHEN s.customer_brings_bottle = 1 THEN 'water_with_exchange'
+           WHEN s.includes_bottle = 1 AND (s.water_price IS NULL OR s.water_price = 0) THEN 'bottle_only'
+           WHEN s.includes_bottle = 1 THEN 'water_only'
+           ELSE 'bottle_only'
+         END) = 'bottle_only'
+           THEN 0
+         WHEN s.customer_brings_bottle = 1
+           THEN (COALESCE(s.water_price, s.price_per_jerrycan) - COALESCE(a.buying_price_per_jerrycan, wbi.buying_price, 0)) * s.jerrycans_sold
+         WHEN s.includes_bottle = 1
+           THEN (COALESCE(s.water_price, s.price_per_jerrycan) - COALESCE(a.buying_price_per_jerrycan, wbi.buying_price, 0)) * s.jerrycans_sold
+         ELSE 0
+       END AS water_profit,
+
+       CASE
+         WHEN COALESCE(s.sale_type, CASE
+           WHEN s.customer_brings_bottle = 1 THEN 'water_with_exchange'
+           WHEN s.includes_bottle = 1 AND (s.water_price IS NULL OR s.water_price = 0) THEN 'bottle_only'
+           WHEN s.includes_bottle = 1 THEN 'water_only'
+           ELSE 'bottle_only'
+         END) = 'water_only'
+           THEN (COALESCE(s.bottle_price_sold, 0) - COALESCE(wbi.bottle_cost, 0)) * s.jerrycans_sold
+         WHEN COALESCE(s.sale_type, CASE
+           WHEN s.customer_brings_bottle = 1 THEN 'water_with_exchange'
+           WHEN s.includes_bottle = 1 AND (s.water_price IS NULL OR s.water_price = 0) THEN 'bottle_only'
+           WHEN s.includes_bottle = 1 THEN 'water_only'
+           ELSE 'bottle_only'
+         END) = 'bottle_only'
+           THEN (COALESCE(s.bottle_price_sold, s.price_per_jerrycan) - COALESCE(wbi.bottle_cost, 0)) * s.jerrycans_sold
+         ELSE 0
+       END AS bottle_profit,
+
+       CASE
+         -- AMAZI GUSA (customer brings bottle)
+         WHEN s.customer_brings_bottle = 1
+           THEN (COALESCE(s.water_price, s.price_per_jerrycan) - COALESCE(a.buying_price_per_jerrycan, wbi.buying_price, 0)) * s.jerrycans_sold
+         
+         -- ICUPA GUSA (bottle only)
+         WHEN s.includes_bottle = 1 AND (s.water_price IS NULL OR s.water_price = 0)
+           THEN ((s.bottle_price_sold) - (wbi.bottle_cost)) * s.jerrycans_sold
+         -- AMAZI + ICUPA (water and bottle)
+         WHEN s.includes_bottle = 1
+           THEN (COALESCE(s.water_price, s.price_per_jerrycan) - COALESCE(a.buying_price_per_jerrycan, wbi.buying_price, 0)) * s.jerrycans_sold
+         
+         -- Default
+         ELSE COALESCE(s.profit, 0)
+       END AS profit,
+
+       (
+         (
+           CASE
+             WHEN COALESCE(s.sale_type, CASE
                WHEN s.customer_brings_bottle = 1 THEN 'water_with_exchange'
                WHEN s.includes_bottle = 1 AND (s.water_price IS NULL OR s.water_price = 0) THEN 'bottle_only'
                WHEN s.includes_bottle = 1 THEN 'water_only'
                ELSE 'bottle_only'
-             END) AS sale_type,
-             a.supplier_name as purchase_supplier,
-             a.buying_price_per_jerrycan as purchase_water_cost,
-             a.bottle_price as purchase_bottle_cost,
-             a.date as purchase_date,
-             COALESCE(wbi.bottle_cost, 0) as item_bottle_cost,
-             CASE
-               WHEN s.customer_brings_bottle = 1
-                 THEN (COALESCE(s.water_price, s.price_per_jerrycan) - COALESCE(a.buying_price_per_jerrycan, 0)) * s.jerrycans_sold
-               WHEN s.includes_bottle = 1 AND (s.water_price IS NULL OR s.water_price = 0)
-                 THEN (s.price_per_jerrycan - COALESCE(wbi.bottle_cost, 0)) * s.jerrycans_sold
-               WHEN s.includes_bottle = 1
-                 THEN ((COALESCE(s.water_price, 0) + COALESCE(s.bottle_price_sold, 0)) - (COALESCE(a.buying_price_per_jerrycan, 0) + COALESCE(a.bottle_price, 0))) * s.jerrycans_sold
-               ELSE (s.price_per_jerrycan - COALESCE(wbi.bottle_cost, 0)) * s.jerrycans_sold
-             END AS profit
-      FROM water_sales s
-      LEFT JOIN water_additions a ON s.purchase_id = a.id
-      LEFT JOIN water_bottle_items wbi ON s.water_bottle_item_id = wbi.id
+             END) = 'bottle_only'
+               THEN 0
+             WHEN s.customer_brings_bottle = 1
+               THEN (COALESCE(s.water_price, s.price_per_jerrycan) - COALESCE(a.buying_price_per_jerrycan, wbi.buying_price, 0)) * s.jerrycans_sold
+             WHEN s.includes_bottle = 1
+               THEN (COALESCE(s.water_price, s.price_per_jerrycan) - COALESCE(a.buying_price_per_jerrycan, wbi.buying_price, 0)) * s.jerrycans_sold
+             ELSE 0
+           END
+         )
+         +
+         (
+           CASE
+             WHEN COALESCE(s.sale_type, CASE
+               WHEN s.customer_brings_bottle = 1 THEN 'water_with_exchange'
+               WHEN s.includes_bottle = 1 AND (s.water_price IS NULL OR s.water_price = 0) THEN 'bottle_only'
+               WHEN s.includes_bottle = 1 THEN 'water_only'
+               ELSE 'bottle_only'
+             END) = 'water_only'
+               THEN (COALESCE(s.bottle_price_sold, 0) - COALESCE(wbi.bottle_cost, 0)) * s.jerrycans_sold
+             WHEN COALESCE(s.sale_type, CASE
+               WHEN s.customer_brings_bottle = 1 THEN 'water_with_exchange'
+               WHEN s.includes_bottle = 1 AND (s.water_price IS NULL OR s.water_price = 0) THEN 'bottle_only'
+               WHEN s.includes_bottle = 1 THEN 'water_only'
+               ELSE 'bottle_only'
+             END) = 'bottle_only'
+               THEN (COALESCE(s.bottle_price_sold, s.price_per_jerrycan) - COALESCE(wbi.bottle_cost, 0)) * s.jerrycans_sold
+             ELSE 0
+           END
+         )
+       ) AS profit_total
+FROM water_sales s
+LEFT JOIN water_additions a ON s.purchase_id = a.id
+LEFT JOIN water_bottle_items wbi ON s.water_bottle_item_id = wbi.id
     `;
     let params = [];
     
@@ -2100,7 +2180,7 @@ router.get('/bottle-items', async (req, res) => {
   try {
     // Create table if it doesn't exist
     await pool.query(`
-      CREATE TABLE IF NOT EXISTS water_bottle_items (
+      CREATE TABLE  water_bottle_items (
         id INT AUTO_INCREMENT PRIMARY KEY,
         water_name VARCHAR(255) NOT NULL,
         capacity_liters DECIMAL(10, 2) NOT NULL,
@@ -2157,7 +2237,7 @@ router.post('/bottle-items', async (req, res) => {
 
     // Create table if it doesn't exist
     await pool.query(`
-      CREATE TABLE IF NOT EXISTS water_bottle_items (
+      CREATE TABLE  water_bottle_items (
         id INT AUTO_INCREMENT PRIMARY KEY,
         water_name VARCHAR(255) NOT NULL,
         capacity_liters DECIMAL(10, 2) NOT NULL,
