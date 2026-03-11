@@ -5,7 +5,7 @@ const pool = mysql.createPool({
   host: process.env.DB_HOST || 'localhost',
   user: process.env.DB_USER || 'root',
   password: process.env.DB_PASSWORD || '',
-  database: process.env.DB_NAME || 'mugeni_shop',
+  database: process.env.DB_NAME || 'client1',
   waitForConnections: true,
   connectionLimit: 10,
   queueLimit: 0

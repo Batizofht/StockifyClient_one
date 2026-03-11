@@ -354,43 +354,106 @@ router.put('/:id', async (req, res) => {
   }
 });
 
-// UPDATE purchase order status
 router.patch('/:id/status', async (req, res) => {
+  const connection = await pool.getConnection();
   try {
     const { id } = req.params;
     const { status } = req.body;
     if (!status) return res.status(400).json({ error: 'Status is required' });
 
+    await connection.beginTransaction();
+
+    const [existingOrders] = await connection.query(
+      'SELECT status FROM purchase_orders WHERE id = ? LIMIT 1',
+      [id]
+    );
+
+    if (!existingOrders.length) {
+      await connection.rollback();
+      return res.status(404).json({ error: 'Purchase order not found' });
+    }
+
+    const previousStatus = existingOrders[0].status;
+
     // If status is changing to 'completed', update stock
-    if (status === 'completed') {
-      const [items] = await pool.query(
+    if (status === 'completed' && previousStatus !== 'completed') {
+      const [items] = await connection.query(
         'SELECT item_id, quantity FROM purchase_order_items WHERE purchase_order_id = ?',
         [id]
       );
 
       for (const item of items) {
-        // Get current stock to calculate new stock
-        const [currentStockRows] = await pool.query('SELECT stock FROM items WHERE id = ?', [item.item_id]);
-        const currentStock = currentStockRows[0]?.stock || 0;
+        const [stockRows] = await connection.query(
+          `SELECT
+             i.sku,
+             i.min_stock,
+             i.cost,
+             i.price,
+             COALESCE(s.current_stock, i.stock, 0) AS current_stock
+           FROM items i
+           LEFT JOIN stock s ON s.item_id = i.id
+           WHERE i.id = ?
+           LIMIT 1`,
+          [item.item_id]
+        );
+
+        if (!stockRows.length) continue;
+
+        const currentStock = Number(stockRows[0].current_stock) || 0;
+        const addedQty = Number(item.quantity) || 0;
+        const nextStock = currentStock + addedQty;
         
         // Save current stock to previous_stock BEFORE updating
-        await savePreviousStock(item.item_id, currentStock);
-        
-        await pool.query(
-          'UPDATE items SET stock = stock + ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
-          [item.quantity, item.item_id]
+        await connection.query(
+          'UPDATE items SET previous_stock = ? WHERE id = ?',
+          [currentStock, item.item_id]
         );
+        
+        await connection.query(
+          'UPDATE items SET stock = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+          [nextStock, item.item_id]
+        );
+
+        const [stockEntries] = await connection.query(
+          'SELECT id FROM stock WHERE item_id = ? LIMIT 1',
+          [item.item_id]
+        );
+
+        if (stockEntries.length > 0) {
+          await connection.query(
+            'UPDATE stock SET current_stock = ?, updated_at = CURRENT_TIMESTAMP WHERE item_id = ?',
+            [nextStock, item.item_id]
+          );
+        } else {
+          await connection.query(
+            `INSERT INTO stock (item_id, sku, current_stock, min_stock, cost_price, selling_price)
+             VALUES (?, ?, ?, ?, ?, ?)`,
+            [
+              item.item_id,
+              stockRows[0].sku || '',
+              nextStock,
+              Number(stockRows[0].min_stock) || 0,
+              Number(stockRows[0].cost) || 0,
+              Number(stockRows[0].price) || 0
+            ]
+          );
+        }
       }
     }
 
-    await pool.query(
+    await connection.query(
       'UPDATE purchase_orders SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
       [status, id]
     );
 
+    await connection.commit();
+
     res.json({ success: true, id, status });
   } catch (error) {
+    await connection.rollback();
     res.status(500).json({ error: error.message });
+  } finally {
+    connection.release();
   }
 });
 

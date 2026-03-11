@@ -31,11 +31,13 @@ const sqlFilesOrder = [
   'add_email_settings.sql',         // Email settings
   'create_previous_stock_table.sql', // Previous stock table
   'add_previous_stock_to_items.sql', // Previous stock column
+  'add_purchase_payment_tracking.sql', // Purchase order payment tracking
   'add_sale_type_column.sql',       // Sale type
   'water_management_water_name.sql', // Water name columns
   'water_bottle_enhancements.sql',  // Bottle enhancements
   'water_jerrycans_water_name.sql', // Jerrycan water name
   'water_sales_bottle_tracking.sql', // Sales bottle tracking
+  'route_schema_backfill.sql',      // Backfill schema previously done in routes
   'add_quantity_to_jerrycans.sql',  // Quantity column
   'water_jerrycans_quantity.sql'    // Quantity migration
 ];
